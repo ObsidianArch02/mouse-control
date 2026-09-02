@@ -57,7 +57,7 @@ cargo build --release
 ./target/release/mouse-control install
 ```
 
-`install` copies the binary to `~/.local/bin/mouse-control`, signs it, writes
+`install` copies the binary to `~/.local/bin/mouse-control`, ad-hoc signs it, writes
 `~/Library/LaunchAgents/com.eacryo.mouse-control.plist`, and bootstraps the agent (an already
 loaded agent is unloaded first, so `install` doubles as the redeploy/restart path). Companion
 subcommands: `status` prints install/service/signing state, `uninstall` stops the agent and
@@ -69,15 +69,13 @@ The agent loads only in GUI sessions and restarts on crash; a menu Quit exits cl
 stays off until the next login or `launchctl kickstart gui/$(id -u)/com.eacryo.mouse-control`.
 launchd's stdout/stderr land in `~/Library/Logs/mouse-control/launchd-{stdout,stderr}.log`.
 
-**Accessibility permission.** TCC matches the grant against the binary's code identity, not
-its path. With the default ad-hoc signature that identity is pinned to the build's cdhash, so
-reinstalling a new build silently invalidates the grant: remove the stale entry under
-System Settings → Privacy & Security → Accessibility and re-add it for the new binary. To
-keep grants across rebuilds, create a self-signed code-signing certificate named
-`mouse-control Code Signing` in Keychain Access (Certificate Assistant → Create a
-Certificate, type Code Signing); `install` detects and uses it automatically, or pass
-`--sign <identity>` explicitly. `mouse-control status` shows the current designated
-requirement.
+**Accessibility permission.** Whenever the app finds itself untrusted (first launch, or after
+`install` redeploys a new build: the ad-hoc signature pins the grant to the build's cdhash, so
+the old grant silently stops matching), it raises the system permission prompt, both at launch
+and when you enable mouse control from the menu. A stale entry from a previous build still
+appears enabled under System Settings → Privacy & Security → Accessibility; remove it, then
+grant again from the prompt. The event tap retries for about two minutes, so granting takes
+effect without relaunching. `mouse-control status` shows the current designated requirement.
 
 ## Configuration
 

@@ -21,23 +21,18 @@ usage = """mouse-control: menu-bar mouse enhancer (single binary, launchd servic
 USAGE:
     mouse-control [run]          run in the foreground (menu-bar icon)
     mouse-control install        install as a launchd agent (start at login)
-        --sign <identity>        sign with this code-signing identity instead of ad-hoc
     mouse-control uninstall      stop and remove the agent and the installed binary
     mouse-control status         show install, service and signing state
     mouse-control --version      print version"""
 unknown_command = "unknown command: {cmd}"
-sign_needs_value = "--sign requires an identity name"
 op_failed = "{action} failed: {error}"
 install_copy = "installed binary: {path}"
 install_copy_skip = "already at the install location, re-signing in place: {path}"
-sign_identity = 'signed with identity "{identity}"; Accessibility grants survive future reinstalls'
-sign_adhoc = "signed ad-hoc; the Accessibility grant is pinned to this exact build and must be re-granted after every reinstall"
-sign_cert_hint = 'tip: create a self-signed certificate named "{cert}" in Keychain Access (menu Keychain Access, Certificate Assistant, Create a Certificate, type Code Signing), then re-run install to keep grants across rebuilds'
 sign_failed = "codesign failed: {error}"
 plist_written = "wrote LaunchAgent plist: {path}"
 agent_replaced = "unloaded the previously loaded agent"
 agent_booted = "agent loaded and started: {label}"
-install_done = "install complete. If Accessibility was granted to a previous build, re-grant it for {path} (System Settings, Privacy & Security, Accessibility)"
+install_done = "install complete. Whenever Accessibility permission is missing (first run, or after reinstalling a new build), the app raises the system permission prompt on launch; if an old mouse-control entry is still listed under System Settings, Privacy & Security, Accessibility, remove it before granting again"
 not_installed = "not installed (no plist at {path})"
 agent_not_loaded = "agent was not loaded"
 uninstall_done = "removed agent {label}, its plist and the installed binary"

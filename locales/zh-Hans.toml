@@ -19,23 +19,18 @@ usage = """mouse-control:菜单栏鼠标增强(单二进制,launchd 服务形态
 用法:
     mouse-control [run]          前台运行(显示菜单栏图标)
     mouse-control install        安装为 launchd 代理(登录时自动启动)
-        --sign <identity>        用指定的代码签名身份签名,缺省为 ad-hoc
     mouse-control uninstall      停止并移除代理与已安装的二进制
     mouse-control status         查看安装、服务与签名状态
     mouse-control --version      打印版本"""
 unknown_command = "未知命令:{cmd}"
-sign_needs_value = "--sign 需要一个签名身份名称"
 op_failed = "{action} 失败:{error}"
 install_copy = "已安装二进制:{path}"
 install_copy_skip = "已在安装位置,原地重新签名:{path}"
-sign_identity = '已用身份 "{identity}" 签名;辅助功能授权在今后重装时保持有效'
-sign_adhoc = "已 ad-hoc 签名;辅助功能授权绑定当前这次构建,每次重装后都要重新授权"
-sign_cert_hint = '提示:在「钥匙串访问」里创建名为 "{cert}" 的自签名证书(菜单:钥匙串访问,证书助理,创建证书,类型选「代码签名」),再重新执行 install,授权即可跨重装保留'
 sign_failed = "codesign 失败:{error}"
 plist_written = "已写入 LaunchAgent plist:{path}"
 agent_replaced = "已卸载先前加载的代理"
 agent_booted = "代理已加载并启动:{label}"
-install_done = "安装完成。若之前给旧构建授过「辅助功能」权限,请为 {path} 重新授权(系统设置,隐私与安全性,辅助功能)"
+install_done = "安装完成。每当缺少辅助功能权限(首次运行或重装新构建后),启动时都会弹出系统授权框;若「系统设置,隐私与安全性,辅助功能」里还留着旧的 mouse-control 条目,请先删除再重新授权"
 not_installed = "未安装({path} 下没有 plist)"
 agent_not_loaded = "代理未处于加载状态"
 uninstall_done = "已移除代理 {label}、plist 与已安装的二进制"

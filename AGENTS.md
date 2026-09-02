@@ -43,7 +43,7 @@ launchd LaunchAgent via its own subcommand:
 cargo test
 cargo build --release
 
-# Copies the binary to ~/.local/bin/mouse-control, signs it (ad-hoc by default), writes
+# Copies the binary to ~/.local/bin/mouse-control, ad-hoc signs it, writes
 # ~/Library/LaunchAgents/com.eacryo.mouse-control.plist, and bootstraps the agent
 # (bootout first when already loaded, so this doubles as the redeploy/restart path).
 ./target/release/mouse-control install
@@ -52,15 +52,14 @@ cargo build --release
 mouse-control uninstall                    # bootout + remove plist and installed binary
 ```
 
-**Accessibility permission is the fragile step.** TCC matches the grant against the binary's
-designated requirement, not its path. With the default ad-hoc signature the requirement is
-pinned to the build's cdhash, so **every reinstall of a new build silently invalidates the
-grant**: remove the stale entry under System Settings → Privacy & Security → Accessibility
-and re-add it for the new binary. To keep grants across rebuilds, create a self-signed
-code-signing certificate named `mouse-control Code Signing` in Keychain Access (Certificate
-Assistant → Create a Certificate, type Code Signing); `install` detects and uses it
-automatically (or pass `--sign <identity>`). `status` prints the current designated
-requirement for diagnosis.
+**Accessibility permission.** Whenever the app finds itself untrusted, it raises the system
+permission prompt: at launch when mouse control is enabled, and again on the menu enable
+toggle. The tap thread's ~2-minute retry window means granting takes effect without a
+relaunch. TCC matches the grant against the binary's designated requirement, which the
+ad-hoc signature pins to the build's cdhash, so **every reinstall of a new build silently
+invalidates the grant**: the stale entry still looks enabled under System Settings →
+Privacy & Security → Accessibility; remove it and grant again from the prompt. `status`
+prints the current designated requirement for diagnosis.
 
 **Permissions & runtime caveats:**
 - The HID-level event tap (`defaultTap` option) requires **Accessibility** permission
@@ -84,9 +83,8 @@ Six modules; the load-bearing parts:
   setup, status-bar icon + menu wiring, startup sequence
   (config load → logger → menu → `mouse::start()` + `mouse::pointer::apply()` when enabled).
 - `service.rs` — `install` / `uninstall` / `status` subcommands: copies the binary to
-  `~/.local/bin`, signs it (self-signed cert `mouse-control Code Signing` when available,
-  ad-hoc otherwise), renders the LaunchAgent plist, and drives `launchctl` bootstrap/bootout.
-  Never initializes AppKit, so it works from non-GUI sessions.
+  `~/.local/bin`, ad-hoc signs it, renders the LaunchAgent plist, and drives `launchctl`
+  bootstrap/bootout. Never initializes AppKit, so it works from non-GUI sessions.
 - `menu.rs` — the three menu items (Enable Mouse Control toggle / Reload Config / Quit) and
   their callbacks. The toggle persists `mouse.enabled` and hot start/stops the event tap;
   reload invalidates the resolve cache and re-applies pointer settings; quit restores them.

@@ -288,6 +288,21 @@ fn main() {
     //    Missing Accessibility just makes the tap retry in-thread; the app keeps running.
     let mouse_enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
     if mouse_enabled {
+        // 缺权限时显式弹系统授权框(每次启动都会检查一次);tap 线程的有限重试会在用户
+        // 授权后自动建成,无需重启。重装新构建后旧授权条目静默失效:弹窗会复现,但列表里
+        // 旧条目仍显示开启,必须删掉重新授权,日志里写明这一点。
+        // Explicitly raise the system prompt when untrusted (checked on every launch); the tap
+        // thread's bounded retry picks up the grant without a restart. After a reinstall the
+        // stale grant silently stops matching: the prompt reappears while the old entry still
+        // looks enabled, so it must be removed and re-granted, as the log line states.
+        if !has_accessibility_permission() {
+            request_accessibility_permission();
+            log_info!(
+                "Accessibility permission missing; system prompt shown. If a mouse-control entry \
+                 from a previous build exists in System Settings > Privacy & Security > \
+                 Accessibility, remove it first, then grant again."
+            );
+        }
         mouse::start();
         mouse::pointer::apply();
     }

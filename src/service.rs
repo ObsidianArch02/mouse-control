@@ -15,15 +15,6 @@ use std::process::Command;
 /// launchd job label; also the codesign identifier. Keeps the bundle id from the app form.
 const LABEL: &str = "com.eacryo.mouse-control";
 
-/// 自签名代码签名证书的推荐名字。钥匙串里存在该证书时 install 自动用它签名:
-/// TCC 的 designated requirement 锚定在证书 leaf 哈希上,重装不再重置辅助功能授权;
-/// ad-hoc 签名则锚定 cdhash,每次重装都失效。
-/// Recommended name for a self-signed code-signing certificate. When present in the keychain,
-/// install signs with it automatically: TCC's designated requirement then anchors to the
-/// cert's leaf hash and Accessibility grants survive reinstalls, whereas ad-hoc signing pins
-/// to the cdhash and breaks on every reinstall.
-const CERT_NAME: &str = "mouse-control Code Signing";
-
 extern "C" {
     fn getuid() -> u32;
 }
@@ -97,28 +88,11 @@ fn print_usage() {
 // ========== install ==========
 
 fn cmd_install(args: &[String]) -> i32 {
-    // --sign <identity>:显式指定签名身份;缺省时自动探测 CERT_NAME,探测不到退化为 ad-hoc。
-    // --sign <identity>: explicit signing identity; otherwise auto-detect CERT_NAME and fall
-    // back to ad-hoc when absent.
-    let mut sign_identity: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--sign" => match args.get(i + 1) {
-                Some(v) => {
-                    sign_identity = Some(v.clone());
-                    i += 2;
-                }
-                None => {
-                    eprintln!("{}", t("service.sign_needs_value"));
-                    return 2;
-                }
-            },
-            other => {
-                eprintln!("{}", tf("service.unknown_command", &[("cmd", other)]));
-                return 2;
-            }
-        }
+    // install 不带参数;未知参数直接报用法错误。
+    // install takes no arguments; anything unknown is a usage error.
+    if let Some(other) = args.first() {
+        eprintln!("{}", tf("service.unknown_command", &[("cmd", other)]));
+        return 2;
     }
 
     let exe = match std::env::current_exe() {
@@ -150,19 +124,13 @@ fn cmd_install(args: &[String]) -> i32 {
         println!("{}", tf("service.install_copy", &[("path", &p)]));
     }
 
-    // 2. 签名。每次必签:刚复制的文件没有有效签名。
+    // 2. 签名。每次必签:刚复制的文件没有有效签名。固定 ad-hoc:本机运行足够;
+    //    辅助功能授权的重新申请由应用内的系统弹窗负责(见 main.rs / menu.rs)。
     // 2. Sign. Mandatory on every install: a freshly copied file has no valid signature.
-    let identity = sign_identity.or_else(detect_cert);
-    if !sign(&target, identity.as_deref()) {
+    //    Always ad-hoc: enough for local runs; re-requesting the Accessibility grant is the
+    //    in-app system prompt's job (see main.rs / menu.rs).
+    if !sign(&target) {
         return 1;
-    }
-    match identity {
-        Some(id) => println!("{}", tf("service.sign_identity", &[("identity", &id)])),
-        None => {
-            println!("{}", t("service.sign_adhoc"));
-            let cert = CERT_NAME;
-            println!("{}", tf("service.sign_cert_hint", &[("cert", cert)]));
-        }
     }
 
     // 3. 写 plist 并加载(已加载则先 bootout 再 bootstrap,等价于重启)。
@@ -329,33 +297,14 @@ fn extract_field<'a>(print_out: &'a str, key: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
-/// 探测钥匙串里的自签名证书。刻意不用 `security find-identity -v`:自签名根证书不受系统
-/// 信任,-v 会把它过滤掉,而 codesign 签名只需要私钥、不要求受信。
-/// Probe the keychain for the self-signed cert. Deliberately avoids
-/// `security find-identity -v`: a self-signed root is untrusted and -v would filter it out,
-/// while codesign only needs the private key, not trust.
-fn detect_cert() -> Option<String> {
-    let out = Command::new("security")
-        .args(["find-identity", "-p", "codesigning"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if text.contains(CERT_NAME) {
-        Some(CERT_NAME.to_string())
-    } else {
-        None
-    }
-}
-
-/// 给已安装的二进制签名。identity 为 None 时 ad-hoc(--sign -)。--identifier 让 TCC 客户端名
-/// 稳定;ad-hoc 下 designated requirement 仍锚定 cdhash(每次重装变化),提示文案由调用方输出。
-/// Sign the installed binary. identity None means ad-hoc (--sign -). --identifier keeps the TCC
-/// client name stable; under ad-hoc the designated requirement still pins to the cdhash (changes
-/// on every reinstall), and the caller is responsible for telling the user.
-fn sign(path: &Path, identity: Option<&str>) -> bool {
-    let id_arg = identity.unwrap_or("-");
+/// 给已安装的二进制做 ad-hoc 签名。--identifier 让 TCC 客户端名稳定;designated requirement
+/// 仍锚定 cdhash(每次重装变化),重装后的重新授权由应用内弹窗引导。
+/// Ad-hoc sign the installed binary. --identifier keeps the TCC client name stable; the
+/// designated requirement still pins to the cdhash (changes on every reinstall), and re-granting
+/// after a reinstall is guided by the in-app prompt.
+fn sign(path: &Path) -> bool {
     let result = Command::new("codesign")
-        .args(["--force", "--sign", id_arg, "--identifier", LABEL])
+        .args(["--force", "--sign", "-", "--identifier", LABEL])
         .arg(path)
         .output();
     match result {

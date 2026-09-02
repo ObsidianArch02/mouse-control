@@ -21,6 +21,15 @@ extern "C" {
     ) -> *const c_void;
     pub(crate) fn CFRelease(cf: *const c_void);
     pub(crate) fn CFEqual(cf1: *const c_void, cf2: *const c_void) -> bool;
+    pub(crate) fn CFDictionaryCreate(
+        allocator: *const c_void,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        num_values: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> *const c_void;
+    pub(crate) static kCFBooleanTrue: *const c_void;
     pub(crate) fn CFRunLoopRunInMode(
         mode: *const c_void,
         seconds: f64,
@@ -32,6 +41,8 @@ extern "C" {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     pub(crate) fn AXIsProcessTrusted() -> bool;
+    pub(crate) fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    pub(crate) static kAXTrustedCheckOptionPrompt: *const c_void;
 }
 
 // AppKit 框架链接占位 / AppKit framework link placeholder
@@ -88,4 +99,33 @@ pub(crate) unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
 /// Whether the current process has Accessibility permission.
 pub(crate) fn has_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
+}
+
+/// 显式请求辅助功能权限:未授权时弹系统授权框(kAXTrustedCheckOptionPrompt=true)。
+/// 返回调用时刻是否已授权。ad-hoc 签名下重装新构建后旧授权条目会静默失效,弹窗会再次
+/// 出现,但列表里的旧条目仍显示开启,用户必须先删掉旧条目再重新授权(调用方负责在
+/// 日志里写明这一步)。
+/// Explicitly request Accessibility permission: shows the system prompt when untrusted
+/// (kAXTrustedCheckOptionPrompt=true). Returns whether the process is trusted at call time.
+/// After reinstalling a new ad-hoc-signed build the old grant silently stops matching, so the
+/// prompt reappears while the stale entry still looks enabled; the user must remove it and
+/// grant again (callers log that step).
+pub(crate) fn request_accessibility_permission() -> bool {
+    unsafe {
+        let keys: [*const c_void; 1] = [kAXTrustedCheckOptionPrompt];
+        let values: [*const c_void; 1] = [kCFBooleanTrue];
+        let options = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        let trusted = AXIsProcessTrustedWithOptions(options);
+        if !options.is_null() {
+            CFRelease(options);
+        }
+        trusted
+    }
 }

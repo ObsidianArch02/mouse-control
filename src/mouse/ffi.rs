@@ -232,7 +232,8 @@ pub(crate) unsafe fn create_tap_with_retry(
         } else {
             log_info!(
                 "[{}] Event tap retry exhausted ({}x). Disabled until restart. \
-                 Grant Accessibility in System Settings and relaunch.",
+                 Grant Accessibility in System Settings and relaunch; if a mouse-control entry \
+                 from a previous build is still listed, remove it first.",
                 log_name,
                 RETRY_MAX
             );

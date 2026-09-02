@@ -85,6 +85,17 @@ pub(crate) extern "C" fn handle_mouse_enable_toggle(
         cfg.mouse.enabled
     };
     if enable {
+        // 启用时若缺辅助功能权限,显式弹系统授权框提醒用户;重装后的旧授权条目需先删除。
+        // When enabling without Accessibility, explicitly raise the system prompt to remind the
+        // user; a stale entry from a previous build must be removed first.
+        if !has_accessibility_permission() {
+            request_accessibility_permission();
+            log_info!(
+                "Accessibility permission missing; system prompt shown. If a mouse-control entry \
+                 from a previous build exists in System Settings > Privacy & Security > \
+                 Accessibility, remove it first, then grant again."
+            );
+        }
         mouse::start();
         mouse::pointer::apply();
         log_info!("Mouse control enabled via menu.");
