@@ -12,3 +12,40 @@ config_read_failed = "無法讀取設定:{error}"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line、continuous 之一'
 mouse_line_count_invalid = "line_count: {value} 必須在 1..=20 之間"
 mouse_button_map_invalid = 'button_map: "{value}" 不是合法的按鍵動作(格式:[修飾鍵+]鍵名,如 "ctrl+left")'
+
+[service]
+usage = """mouse-control:選單列滑鼠增強(單一二進位檔,launchd 服務形態)
+
+用法:
+    mouse-control [run]          前台執行(顯示選單列圖示)
+    mouse-control install        安裝為 launchd 代理(登入時自動啟動)
+        --sign <identity>        用指定的程式碼簽署身分簽署,預設為 ad-hoc
+    mouse-control uninstall      停止並移除代理與已安裝的二進位檔
+    mouse-control status         檢視安裝、服務與簽署狀態
+    mouse-control --version      列印版本"""
+unknown_command = "未知指令:{cmd}"
+sign_needs_value = "--sign 需要一個簽署身分名稱"
+op_failed = "{action} 失敗:{error}"
+install_copy = "已安裝二進位檔:{path}"
+install_copy_skip = "已在安裝位置,原地重新簽署:{path}"
+sign_identity = '已用身分 "{identity}" 簽署;輔助使用授權在今後重新安裝時保持有效'
+sign_adhoc = "已 ad-hoc 簽署;輔助使用授權綁定當前這次建置,每次重新安裝後都要重新授權"
+sign_cert_hint = '提示:在「鑰匙圈存取」裡建立名為 "{cert}" 的自簽憑證(選單:鑰匙圈存取,憑證輔助程式,建立憑證,類型選「程式碼簽署」),再重新執行 install,授權即可跨重新安裝保留'
+sign_failed = "codesign 失敗:{error}"
+plist_written = "已寫入 LaunchAgent plist:{path}"
+agent_replaced = "已卸載先前載入的代理"
+agent_booted = "代理已載入並啟動:{label}"
+install_done = "安裝完成。若之前給舊建置授過「輔助使用」權限,請為 {path} 重新授權(系統設定,隱私權與安全性,輔助使用)"
+not_installed = "未安裝({path} 下沒有 plist)"
+agent_not_loaded = "代理未處於載入狀態"
+uninstall_done = "已移除代理 {label}、plist 與已安裝的二進位檔"
+uninstall_kept = "保留了設定與記錄:{config_dir},{log_dir}"
+status_this = "目前二進位檔:{path}(v{version})"
+status_installed = "已安裝二進位檔:{path}({version})"
+status_installed_missing = "已安裝二進位檔:缺失(應在 {path})"
+status_plist = "launchd plist:{path}({state})"
+state_present = "存在"
+state_missing = "缺失"
+status_loaded = "launchd:已載入,pid {pid},狀態 {state}"
+status_not_loaded = "launchd:未載入"
+status_requirement = "designated requirement:{req}"

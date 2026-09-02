@@ -87,7 +87,8 @@ pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
 
 /// 在主线程早期调用，启动后台 writer 线程。
 /// Call early on the main thread to start the background writer thread.
-/// `is_dev`: cargo run → stdout; 打包 .app → 文件 / packaged .app → file.
+/// `is_dev`: target/ 下运行 → 同时输出 stdout;安装形态 → 只写文件 /
+/// running under target/ → also mirrors to stdout; installed form → file only.
 pub fn init(config: &LogConfig, is_dev: bool) {
     let (tx, rx) = flume::bounded::<String>(LOG_CHANNEL_CAPACITY);
     LOG_TX.set(tx).ok();

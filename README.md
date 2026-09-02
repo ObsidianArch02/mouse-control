@@ -7,6 +7,10 @@ mouse functionality with no window switcher and no settings window.
 It is pure Rust calling AppKit / CoreGraphics / IOKit directly through `objc2` FFI — no Swift
 bridge, no UI framework, no Dock icon.
 
+It ships as a **single unbundled binary** with no `.app` packaging: the binary registers
+itself as a launchd LaunchAgent (auto-start at login, restart on crash) and still shows the
+menu-bar icon, because the agent runs inside the user's GUI session.
+
 ## Features
 
 - **Reverse scrolling** — flip the wheel direction relative to the system's current setting.
@@ -43,6 +47,37 @@ cargo check   # fast type-check
 cargo test    # unit tests (profile resolution + scroll direction)
 cargo run     # build + run (takes over the mouse event tap)
 ```
+
+## Run as a login service
+
+The binary installs itself as a launchd LaunchAgent:
+
+```sh
+cargo build --release
+./target/release/mouse-control install
+```
+
+`install` copies the binary to `~/.local/bin/mouse-control`, signs it, writes
+`~/Library/LaunchAgents/com.eacryo.mouse-control.plist`, and bootstraps the agent (an already
+loaded agent is unloaded first, so `install` doubles as the redeploy/restart path). Companion
+subcommands: `status` prints install/service/signing state, `uninstall` stops the agent and
+removes the plist and installed binary (config and logs are kept), `--help` prints usage.
+Running the binary with no arguments behaves exactly like before: foreground process with the
+menu-bar icon.
+
+The agent loads only in GUI sessions and restarts on crash; a menu Quit exits cleanly and
+stays off until the next login or `launchctl kickstart gui/$(id -u)/com.eacryo.mouse-control`.
+launchd's stdout/stderr land in `~/Library/Logs/mouse-control/launchd-{stdout,stderr}.log`.
+
+**Accessibility permission.** TCC matches the grant against the binary's code identity, not
+its path. With the default ad-hoc signature that identity is pinned to the build's cdhash, so
+reinstalling a new build silently invalidates the grant: remove the stale entry under
+System Settings → Privacy & Security → Accessibility and re-add it for the new binary. To
+keep grants across rebuilds, create a self-signed code-signing certificate named
+`mouse-control Code Signing` in Keychain Access (Certificate Assistant → Create a
+Certificate, type Code Signing); `install` detects and uses it automatically, or pass
+`--sign <identity>` explicitly. `mouse-control status` shows the current designated
+requirement.
 
 ## Configuration
 

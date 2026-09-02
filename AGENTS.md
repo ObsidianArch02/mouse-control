@@ -4,7 +4,7 @@ This file provides guidance to coding agents working in this repository.
 
 ## What this is
 
-`mouse-control` is a minimal macOS menu-bar accessory app (no Dock icon) that enhances the
+`mouse-control` is a minimal macOS menu-bar accessory (no Dock icon) that enhances the
 mouse: per-device VID+PID config profiles, reverse/line scroll modes, and optional disabling
 of pointer acceleration. It is a stripped-down extract of the mouse-control features from
 `oh-my-tab` — there is no window switcher, no settings window, and no keyboard global
@@ -12,6 +12,11 @@ shortcut.
 
 It is Rust calling AppKit / CoreGraphics / IOKit directly via `objc2` FFI — no Swift bridge,
 no Rust UI framework.
+
+Form factor: a **single unbundled binary** with no `.app` packaging. The binary registers
+itself as a launchd LaunchAgent (`mouse-control install`) that auto-starts at login and
+restarts on crash; the menu-bar icon still shows because the agent runs in the user's GUI
+session.
 
 ## Build & run
 
@@ -26,15 +31,10 @@ cargo clippy     # available, not wired into CI
 `~/nix-darwin/home.nix`). In interactive shells mise activate provides them; in
 non-interactive shells use `mise exec -- cargo ...`.
 
-## Packaging & redeploying to /Applications
+## Install & redeploy as a launchd service
 
-When the user asks to package or redeploy for manual testing, deploy the app to
-`/Applications/Mouse Control.app` (not `~/Desktop` or `dist/`). Reuse the bundle layout from
-the first packaging session: release binary + `assets/Info.plist` + `assets/statusbar-icon.png`,
-then ad-hoc sign and verify.
-
-On every redeploy, reset the Accessibility permission before opening the app. That removes
-the old TCC grant and makes the next launch trigger the system permission prompt again:
+When the user asks to package or redeploy for manual testing, install the binary as a
+launchd LaunchAgent via its own subcommand:
 
 ```sh
 # cargo/rustc come from the mise-managed Rust toolchain (mise activate is wired into the
@@ -43,50 +43,50 @@ the old TCC grant and makes the next launch trigger the system permission prompt
 cargo test
 cargo build --release
 
-MOUSE_APP_DIR="/Applications/Mouse Control.app"
-MOUSE_BUNDLE_ID="com.eacryo.mouse-control"
+# Copies the binary to ~/.local/bin/mouse-control, signs it (ad-hoc by default), writes
+# ~/Library/LaunchAgents/com.eacryo.mouse-control.plist, and bootstraps the agent
+# (bootout first when already loaded, so this doubles as the redeploy/restart path).
+./target/release/mouse-control install
 
-# Stop the current instance before replacing the bundle.
-pkill -x mouse-control 2>/dev/null || true
-
-# Remove the old Accessibility grant so the next launch re-prompts.
-# If assets/Info.plist's CFBundleIdentifier ever changes, update MOUSE_BUNDLE_ID.
-tccutil reset Accessibility "$MOUSE_BUNDLE_ID"
-
-# Rebuild the bundle in /Applications.
-rm -rf "$MOUSE_APP_DIR"
-mkdir -p "$MOUSE_APP_DIR/Contents/MacOS" "$MOUSE_APP_DIR/Contents/Resources"
-cp target/release/mouse-control "$MOUSE_APP_DIR/Contents/MacOS/mouse-control"
-cp assets/Info.plist "$MOUSE_APP_DIR/Contents/Info.plist"
-cp assets/statusbar-icon.png "$MOUSE_APP_DIR/Contents/Resources/statusbar-icon.png"
-
-# Ad-hoc local signing is enough for local testing.
-# Use Developer ID + notarization only if the user asks for distribution.
-codesign --force --deep --sign - "$MOUSE_APP_DIR"
-codesign --verify --deep --strict --verbose=2 "$MOUSE_APP_DIR"
-
-open "$MOUSE_APP_DIR"
+./target/release/mouse-control status      # install / service / signing state
+mouse-control uninstall                    # bootout + remove plist and installed binary
 ```
 
-After `open`, do not silently skip the permission step: the user should see the macOS
-Accessibility prompt, or open System Settings → Privacy & Security → Accessibility and enable
-**Mouse Control**. Logs remain at `~/Library/Logs/mouse-control/mouse-control-<timestamp>.log`.
+**Accessibility permission is the fragile step.** TCC matches the grant against the binary's
+designated requirement, not its path. With the default ad-hoc signature the requirement is
+pinned to the build's cdhash, so **every reinstall of a new build silently invalidates the
+grant**: remove the stale entry under System Settings → Privacy & Security → Accessibility
+and re-add it for the new binary. To keep grants across rebuilds, create a self-signed
+code-signing certificate named `mouse-control Code Signing` in Keychain Access (Certificate
+Assistant → Create a Certificate, type Code Signing); `install` detects and uses it
+automatically (or pass `--sign <identity>`). `status` prints the current designated
+requirement for diagnosis.
 
 **Permissions & runtime caveats:**
 - The HID-level event tap (`defaultTap` option) requires **Accessibility** permission
-  (`AXIsProcessTrusted`) to modify/drop events. Grant it under System Settings → Privacy &
-  Security → Accessibility. Without it the tap thread retries (3s × 40) and logs; the app
-  keeps running. A freshly built binary at a new path must be re-granted.
+  (`AXIsProcessTrusted`) to modify/drop events. Without it the tap thread retries (3s × 40)
+  and logs; the app keeps running.
+- The agent loads only in GUI sessions (`LimitLoadToSessionType=Aqua`,
+  `ProcessType=Interactive`), so the menu-bar icon works; it restarts on crash
+  (`KeepAlive.SuccessfulExit=false`) but a menu Quit stays off until next login or
+  `launchctl kickstart gui/$(id -u)/com.eacryo.mouse-control`.
 - Runtime config: `~/.config/mouse-control/config.toml` (auto-created with defaults on first
   run). Pointer settings are restored on quit or when disabled.
-- Logs: `~/Library/Logs/mouse-control/mouse-control-<timestamp>.log` (30-day retention).
+- Logs: `~/Library/Logs/mouse-control/mouse-control-<timestamp>.log` (30-day retention);
+  launchd's stdout/stderr go to `launchd-{stdout,stderr}.log` in the same directory.
+- `assets/Info.plist` is leftover from the `.app` era and is not used by the service form.
 
 ## Architecture
 
 Six modules; the load-bearing parts:
 
-- `main.rs` — NSApplication accessory setup, status-bar icon + menu wiring, startup sequence
+- `main.rs` — subcommand dispatch (before any AppKit/CONFIG init), NSApplication accessory
+  setup, status-bar icon + menu wiring, startup sequence
   (config load → logger → menu → `mouse::start()` + `mouse::pointer::apply()` when enabled).
+- `service.rs` — `install` / `uninstall` / `status` subcommands: copies the binary to
+  `~/.local/bin`, signs it (self-signed cert `mouse-control Code Signing` when available,
+  ad-hoc otherwise), renders the LaunchAgent plist, and drives `launchctl` bootstrap/bootout.
+  Never initializes AppKit, so it works from non-GUI sessions.
 - `menu.rs` — the three menu items (Enable Mouse Control toggle / Reload Config / Quit) and
   their callbacks. The toggle persists `mouse.enabled` and hot start/stops the event tap;
   reload invalidates the resolve cache and re-applies pointer settings; quit restores them.

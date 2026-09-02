@@ -1,13 +1,17 @@
-//! mouse-control:最小菜单栏 accessory 应用,只做鼠标控制。
+//! mouse-control:最小菜单栏 accessory 进程,只做鼠标控制。
 //! 能力:per-device VID+PID 配置档、指针加速禁用/恢复、滚轮 default/line 两模式 + 反转、
 //! 运行时热开关、配置热重载、设备热插拔重建。纯 Rust + objc2 调 AppKit/CoreGraphics/IOKit,
 //! 无 Swift bridge、无 UI 框架。
+//! 形态:单二进制、无 .app 封装;install/uninstall/status 子命令把它注册成 launchd
+//! LaunchAgent(见 service.rs),菜单栏图标照常显示。
 //!
-//! mouse-control: a minimal menu-bar accessory app for mouse control only.
+//! mouse-control: a minimal menu-bar accessory process for mouse control only.
 //! Capabilities: per-device VID+PID profiles, pointer-acceleration disable/restore, scroll
 //! modes default/line with reverse, runtime hot toggle, config hot reload, and device
 //! plug/unplug rebuilds. Pure Rust + objc2 calling AppKit/CoreGraphics/IOKit -- no Swift
 //! bridge, no UI framework.
+//! Form factor: a single binary with no .app bundle; the install/uninstall/status subcommands
+//! register it as a launchd LaunchAgent (see service.rs) while the menu-bar icon still shows.
 
 mod app;
 mod config;
@@ -16,6 +20,7 @@ mod i18n;
 mod logger;
 mod menu;
 mod mouse;
+mod service;
 
 use config::CONFIG;
 use ffi::*;
@@ -207,11 +212,22 @@ fn setup_status_bar() {
 // ========== Main ==========
 
 fn main() {
+    // 0. 子命令分发(install/uninstall/status 等)。必须在任何 AppKit/CONFIG 初始化之前:
+    //    服务管理不需要 GUI,也不应触发配置文件创建。
+    // 0. Subcommand dispatch (install/uninstall/status/...). Must run before any AppKit/CONFIG
+    //    init: service management needs no GUI and must not create the config file.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = service::dispatch(&args) {
+        std::process::exit(code);
+    }
+
     // 1. Init NSApplication as accessory (no dock icon)
     init_app();
 
-    // 1b. 初始化 logger:早于一切,从 CONFIG 读日志级别,根据 cargo run / .app 决定输出目标。
-    //     Init logger: before everything else, read log level from CONFIG, auto-detect dev/prod.
+    // 1b. 初始化 logger:早于一切,从 CONFIG 读日志级别;二进制在 target/ 下运行时视为
+    //     dev(同时输出 stdout),安装形态只写文件。
+    //     Init logger: before everything else, read log level from CONFIG; a binary running
+    //     under target/ is dev (mirrors to stdout), the installed form writes file only.
     {
         let cfg = CONFIG.read().unwrap(); // 触发 LazyLock 初始化和 config 加载
         let level = match cfg.logging.level.as_str() {
