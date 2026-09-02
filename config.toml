@@ -1,0 +1,25 @@
+[logging]
+level = "info"
+file_path = ""
+
+[i18n]
+locale = "auto"
+
+[mouse]
+enabled = true
+
+[[mouse.profiles]]
+reverse_scroll = true
+scroll_mode = "line"
+line_count = 3
+
+[mouse.profiles.pointer]
+disable_acceleration = true
+
+[mouse.profiles.button_map]
+3 = "ctrl+right"
+4 = "ctrl+left"
+
+[[mouse.profiles]]
+app_bundle_id = "com.apple.ScreenContinuity"
+scroll_mode = "continuous"

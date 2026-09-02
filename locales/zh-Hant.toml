@@ -1,0 +1,14 @@
+# 繁體中文。鍵名與 en.toml 保持一致,只改文案。
+
+[menu]
+enable_mouse = "啟用滑鼠控制"
+reload_config = "重新載入設定"
+quit = "結束"
+
+[errors]
+i18n_locale_invalid = 'i18n.locale: "{value}" 不是 auto、en、zh-Hans、zh-Hant 之一'
+logging_level_invalid = "logging.level: '{value}' 無效(可選:debug、info)"
+config_read_failed = "無法讀取設定:{error}"
+mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line、continuous 之一'
+mouse_line_count_invalid = "line_count: {value} 必須在 1..=20 之間"
+mouse_button_map_invalid = 'button_map: "{value}" 不是合法的按鍵動作(格式:[修飾鍵+]鍵名,如 "ctrl+left")'
