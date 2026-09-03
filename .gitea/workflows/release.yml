@@ -100,15 +100,23 @@ jobs:
             | sed -nE 's/.*"id": *([0-9]+).*/\1/p' | head -1 || true)"
           if [ -n "${EXISTING_ID}" ]; then
             curl -fsS -X DELETE -H "Authorization: token ${TOKEN}" \
-              "${API}/repos/${REPO}/releases/${EXISTING_ID}"
+              "${API}/repos/${REPO}/releases/${EXISTING_ID}" || true
             curl -fsS -X DELETE -H "Authorization: token ${TOKEN}" \
-              "${API}/repos/${REPO}/tags/${TAG}"
+              "${API}/repos/${REPO}/tags/${TAG}" || true
             echo "Removed pre-existing release ${TAG}"
           fi
 
+          # Gitea 的 release API 不会自动建标签:先用 git 推送标签,再建 release。
+          # Gitea's release API does not auto-create tags: push the tag with git first.
+          REMOTE="http://oauth2:${TOKEN}@host.docker.internal:3000/${REPO}.git"
+          git ls-remote "${REMOTE}" HEAD >/dev/null 2>&1 || \
+            REMOTE="http://oauth2:${TOKEN}@m4mac.local:3000/${REPO}.git"
+          git tag -f "${TAG}" "${GITHUB_SHA}"
+          git push --force -q "${REMOTE}" "refs/tags/${TAG}:refs/tags/${TAG}"
+
           BODY="Auto build from ${SHA7}: ${SUBJECT_ESC}"$'\n'$'\n'"Commit: ${COMMIT_URL}"
-          JSON="$(printf '{"tag_name":"%s","target_commitish":"%s","name":"%s","body":"%s"}' \
-            "${TAG}" "${GITHUB_SHA}" "${NAME}" "${BODY}")"
+          JSON="$(printf '{"tag_name":"%s","name":"%s","body":"%s"}' \
+            "${TAG}" "${NAME}" "${BODY}")"
           RESP="$(curl -fsS -X POST -H "Authorization: token ${TOKEN}" \
             -H 'Content-Type: application/json' -d "${JSON}" \
             "${API}/repos/${REPO}/releases")"
