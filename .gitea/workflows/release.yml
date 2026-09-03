@@ -27,17 +27,19 @@ jobs:
     env:
       TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # 检出(替代 actions/checkout):容器内先试 host.docker.internal,失败再试 m4mac.local。
-      # Checkout (replacing actions/checkout): try host.docker.internal first, then
-      # m4mac.local.
+      # 检出(替代 actions/checkout):优先 m4mac.local(对用户可见的 host),容器内解析
+      # 不到再退回 host.docker.internal。
+      # Checkout (replacing actions/checkout): prefer m4mac.local (the user-facing host),
+      # fall back to host.docker.internal when it does not resolve inside the container.
       - name: Checkout
         run: |
           set -euo pipefail
-          GIT_URL="http://oauth2:${TOKEN}@host.docker.internal:3000/${GITHUB_REPOSITORY}.git"
+          GIT_URL="http://oauth2:${TOKEN}@m4mac.local:3000/${GITHUB_REPOSITORY}.git"
           if ! git ls-remote "${GIT_URL}" HEAD >/dev/null 2>&1; then
-            GIT_URL="http://oauth2:${TOKEN}@m4mac.local:3000/${GITHUB_REPOSITORY}.git"
+            GIT_URL="http://oauth2:${TOKEN}@host.docker.internal:3000/${GITHUB_REPOSITORY}.git"
             git ls-remote "${GIT_URL}" HEAD >/dev/null 2>&1
           fi
+          echo "clone host: ${GIT_URL#*@}"
           git clone --quiet --no-tags "${GIT_URL}" .
           git checkout --quiet "${GITHUB_SHA}"
 
@@ -90,7 +92,15 @@ jobs:
           # JSON 转义:提交标题可能含引号或反斜杠。
           # JSON-escape: the commit subject may contain quotes or backslashes.
           SUBJECT_ESC="$(printf '%s' "$SUBJECT" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-          COMMIT_URL="${GITHUB_SERVER_URL}/${REPO}/commit/${GITHUB_SHA}"
+          # 用户可见链接用解析到的真实 host(优先 m4mac.local),不用容器内的
+          # GITHUB_SERVER_URL(可能是 host.docker.internal,浏览器打不开)。
+          # Use the resolved real host (m4mac.local preferred) for user-facing links, not
+          # the container GITHUB_SERVER_URL, which may be host.docker.internal.
+          REMOTE="http://oauth2:${TOKEN}@m4mac.local:3000/${REPO}.git"
+          git ls-remote "${REMOTE}" HEAD >/dev/null 2>&1 || \
+            REMOTE="http://oauth2:${TOKEN}@host.docker.internal:3000/${REPO}.git"
+          GIT_HOST="$(printf '%s' "${REMOTE}" | sed -E 's|.*@([^/]+)/.*|\1|')"
+          COMMIT_URL="http://${GIT_HOST}/${REPO}/commit/${GITHUB_SHA}"
           NAME="mouse-control ${VERSION} (${SHA7})"
 
           # 已存在的同标签 release 先删(连带标签),保持幂等。
@@ -108,9 +118,6 @@ jobs:
 
           # Gitea 的 release API 不会自动建标签:先用 git 推送标签,再建 release。
           # Gitea's release API does not auto-create tags: push the tag with git first.
-          REMOTE="http://oauth2:${TOKEN}@host.docker.internal:3000/${REPO}.git"
-          git ls-remote "${REMOTE}" HEAD >/dev/null 2>&1 || \
-            REMOTE="http://oauth2:${TOKEN}@m4mac.local:3000/${REPO}.git"
           git tag -f "${TAG}" "${GITHUB_SHA}"
           git push --force -q "${REMOTE}" "refs/tags/${TAG}:refs/tags/${TAG}"
 
