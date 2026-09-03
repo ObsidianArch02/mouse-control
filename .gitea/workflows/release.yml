@@ -47,7 +47,8 @@ jobs:
         run: |
           set -euo pipefail
           uname -m
-          rustc -vV | head -1
+          rustc --version
+          cargo --version
           command -v curl >/dev/null && echo curl-ok
           cargo build --release --locked --target aarch64-apple-darwin
           test -x target/aarch64-apple-darwin/release/mouse-control
