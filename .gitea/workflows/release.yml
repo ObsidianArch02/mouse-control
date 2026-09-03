@@ -1,22 +1,17 @@
 # 每次 main 分支推送都构建 macOS arm64 二进制并发布到 Gitea Release。
-# 本机 Gitea 的 runner 是 ubuntu 容器(gitea-runner-mini),没有 macOS runner,
-# 所以用 cargo-zigbuild(zig 链接器)+ macOS SDK 在 Linux 容器里交叉编译
-# aarch64-apple-darwin。SDK 来自 joseluisq/macosx-sdks 的发布附件(单文件 tarball,
-# 含公开 sha256;SDK 归属 Apple,仅用于本地开发构建)。
-# 运行目标是 macOS 26+,deployment target 与 SDK 均取 26.x。
-# 交叉产物没有 LC_CODE_SIGNATURE,Apple Silicon 上无法直接运行,发布前用
-# Apple 开源 rcodesign 补 ad-hoc 签名(与 macOS 本机 ld 的默认行为一致)。
+# 环境:joseluisq/rust-linux-darwin-builder:2.0.0-beta.1(osxcross,预装 rust stable、
+# aarch64-apple-darwin 目标与 macOS SDK),multi-arch,在 arm64 runner 上原生拉取,
+# 镜像由 mini 的 docker daemon 缓存,后续 run 不再重复下载 SDK/工具链。
+# 注意:镜像里没有 node,Gitea act 用 node 执行 JavaScript action(如 actions/checkout),
+# 因此本工作流全部用纯 shell 步骤,自写 clone。
 #
 # Build the macOS arm64 binary on every push to main and publish it to a Gitea Release.
-# The Gitea instance's runner is an ubuntu container (gitea-runner-mini) with no macOS
-# runner, so we cross-compile aarch64-apple-darwin inside the Linux container with
-# cargo-zigbuild (zig linker) plus a macOS SDK. The SDK comes from the
-# joseluisq/macosx-sdks release assets (single-file tarball with a published sha256;
-# the SDK belongs to Apple and is used for local development builds only).
-# The target runtime is macOS 26+; both the deployment target and the SDK are 26.x.
-# Cross-compiled output carries no LC_CODE_SIGNATURE and cannot run on Apple Silicon,
-# so it gets an ad-hoc signature from Apple's open-source rcodesign before release
-# (matching what macOS's own ld does by default).
+# Environment: joseluisq/rust-linux-darwin-builder:2.0.0-beta.1 (osxcross, ships stable
+# rust, the aarch64-apple-darwin target and a macOS SDK), multi-arch, pulled natively on
+# the arm64 runner and cached by the mini's docker daemon, so later runs skip the
+# SDK/toolchain downloads entirely.
+# Note: this image has no node, and Gitea act executes JavaScript actions (like
+# actions/checkout) with node, so this workflow is all plain-shell steps with its own clone.
 name: release-macos-arm64
 
 on:
@@ -27,73 +22,41 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: joseluisq/rust-linux-darwin-builder:2.0.0-beta.1
+    env:
+      TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-
-      # Rust 工具链 + 目标平台 std。只装 minimal profile,够编译即可。
-      # Rust toolchain plus the target's std. Minimal profile is enough.
-      - name: Install Rust (aarch64-apple-darwin target)
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --target aarch64-apple-darwin
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      # cargo-zigbuild 内部通过 ziglang crate 自动下载匹配的 zig 编译器,无需手动装 zig。
-      # cargo-zigbuild auto-downloads a matching zig compiler via the ziglang crate.
-      - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild --version 0.19.5
-
-      # cargo-zigbuild 不自带 zig,需要显式安装(固定 0.15.2;按 runner 架构选包)。
-      # cargo-zigbuild does not ship zig; install it explicitly (pinned to 0.15.2,
-      # package chosen by runner arch).
-      - name: Install zig
+      # 检出(替代 actions/checkout):容器内先试 host.docker.internal,失败再试 m4mac.local。
+      # Checkout (replacing actions/checkout): try host.docker.internal first, then
+      # m4mac.local.
+      - name: Checkout
         run: |
           set -euo pipefail
-          case "$(uname -m)" in
-            aarch64|arm64) ZARCH=aarch64 ;;
-            x86_64|amd64)  ZARCH=x86_64 ;;
-            *) echo "unsupported arch: $(uname -m)"; exit 1 ;;
-          esac
-          mkdir -p "$HOME/zig" && cd "$HOME/zig"
-          curl -fL --retry 3 -o zig.tar.xz \
-            "https://ziglang.org/download/0.15.2/zig-${ZARCH}-linux-0.15.2.tar.xz"
-          tar -xf zig.tar.xz
-          rm zig.tar.xz
-          mv "zig-${ZARCH}-linux-0.15.2/zig" ./
-          echo "$HOME/zig" >> "$GITHUB_PATH"
-          zig version
+          GIT_URL="http://oauth2:${TOKEN}@host.docker.internal:3000/${GITHUB_REPOSITORY}.git"
+          if ! git ls-remote "${GIT_URL}" HEAD >/dev/null 2>&1; then
+            GIT_URL="http://oauth2:${TOKEN}@m4mac.local:3000/${GITHUB_REPOSITORY}.git"
+            git ls-remote "${GIT_URL}" HEAD >/dev/null 2>&1
+          fi
+          git clone --quiet --no-tags "${GIT_URL}" .
+          git checkout --quiet "${GITHUB_SHA}"
 
-      # 下载并校验 macOS 26.1 SDK(SDKROOT 指它,cargo-zigbuild 才能链接 darwin framework)。
-      # Download and verify the macOS 26.1 SDK (SDKROOT points at it so cargo-zigbuild can
-      # link darwin frameworks).
-      - name: Install macOS SDK
+      # 工具链与基础工具自检,防止镜像变化时静默出错。
+      # Sanity-check the toolchain and base tools so an image change cannot fail silently.
+      - name: Build
         run: |
-          mkdir -p "$HOME/sdk" && cd "$HOME/sdk"
-          curl -fL --retry 3 -o MacOSX26.1.sdk.tar.xz \
-            https://github.com/joseluisq/macosx-sdks/releases/download/26.1/MacOSX26.1.sdk.tar.xz
-          echo "beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c  MacOSX26.1.sdk.tar.xz" | sha256sum -c
-          tar -xf MacOSX26.1.sdk.tar.xz
-          rm MacOSX26.1.sdk.tar.xz
+          set -euo pipefail
+          uname -m
+          rustc -vV | head -1
+          command -v curl >/dev/null && echo curl-ok
+          cargo build --release --locked --target aarch64-apple-darwin
+          test -x target/aarch64-apple-darwin/release/mouse-control
 
-      # 交叉编译。SDKROOT 让 zig 找到 AppKit/CoreGraphics/IOKit 等 framework;
-      # MACOSX_DEPLOYMENT_TARGET=26.0:运行环境是 macOS 26+,产物只承诺 26+。
-      # Cross-compile. SDKROOT lets zig find AppKit/CoreGraphics/IOKit etc.;
-      # MACOSX_DEPLOYMENT_TARGET=26.0: the runtime is macOS 26+, so the artifact only
-      # promises 26+.
-      - name: Build (cargo zigbuild)
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "26.0"
-        run: |
-          # SDK 装在 $HOME/sdk,显式设置 SDKROOT 让 zig 找到 framework。
-          # The SDK lives in $HOME/sdk; SDKROOT is set explicitly so zig finds the frameworks.
-          export SDKROOT="$HOME/sdk/MacOSX26.1.sdk"
-          cargo zigbuild --release --locked --target aarch64-apple-darwin
-
-      # Apple 的开源 rcodesign(musl 静态构建,任意 linux 容器可跑),默认 ad-hoc 签名。
+      # Apple 的开源 rcodesign(musl 静态构建),默认 ad-hoc 签名。
       # --binary-identifier 与 install 子命令里 codesign 用的 identifier 一致。
-      # Apple's open-source rcodesign (musl static build, runs in any linux container),
-      # ad-hoc by default. --binary-identifier matches the identifier used by the install
-      # subcommand's codesign call.
-      - name: Ad-hoc sign (rcodesign)
+      # Apple's open-source rcodesign (musl static build), ad-hoc by default.
+      # --binary-identifier matches the identifier used by the install subcommand.
+      - name: Ad-hoc sign
         run: |
           set -euo pipefail
           case "$(uname -m)" in
@@ -101,25 +64,20 @@ jobs:
             x86_64|amd64)  RARCH=x86_64 ;;
             *) echo "unsupported runner arch: $(uname -m)"; exit 1 ;;
           esac
-          mkdir -p "$HOME/bin" && cd "$HOME/bin"
           curl -fL --retry 3 -o rcodesign.tar.gz \
             "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-${RARCH}-unknown-linux-musl.tar.gz"
           tar -xzf rcodesign.tar.gz
-          rm rcodesign.tar.gz
-          find . -name rcodesign -type f | head -1 | xargs -I{} mv {} "$HOME/bin/rcodesign"
-          chmod +x "$HOME/bin/rcodesign"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-          "$HOME/bin/rcodesign" sign --binary-identifier com.eacryo.mouse-control \
+          find . -name rcodesign -type f | head -1 | xargs -I{} mv {} ./rcodesign
+          chmod +x ./rcodesign
+          ./rcodesign sign --binary-identifier com.eacryo.mouse-control \
             target/aarch64-apple-darwin/release/mouse-control
 
       # 发布到 Gitea Release。每次 main 推送用 v<版本>-<sha7> 作标签,保证唯一;
       # 若同标签已存在(重跑同一提交)先删旧 release 与标签再重建,幂等。
-      # Publish to a Gitea Release. Each main push gets a unique tag
-      # v<version>-<sha7>; if the tag already exists (re-run of the same commit),
-      # delete the old release and tag first, so this step is idempotent.
+      # Publish to a Gitea Release. Each main push gets a unique tag v<version>-<sha7>;
+      # if the tag already exists (re-run of the same commit), delete the old release and
+      # tag first, so this step is idempotent.
       - name: Publish release
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           API="${GITHUB_API_URL}"
@@ -157,10 +115,6 @@ jobs:
 
           BIN="target/aarch64-apple-darwin/release/mouse-control"
           test -x "${BIN}"
-
-          # 校验产物架构,防止工具链变化时悄悄产出错误二进制。
-          # Verify the artifact architecture so a toolchain change cannot silently
-          # produce the wrong binary.
           file "${BIN}" | grep -q 'aarch64'
 
           curl -fsS -X POST -H "Authorization: token ${TOKEN}" \
