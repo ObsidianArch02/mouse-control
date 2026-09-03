@@ -117,9 +117,10 @@ jobs:
           BODY="Auto build from ${SHA7}: ${SUBJECT_ESC}"$'\n'$'\n'"Commit: ${COMMIT_URL}"
           JSON="$(printf '{"tag_name":"%s","name":"%s","body":"%s"}' \
             "${TAG}" "${NAME}" "${BODY}")"
-          RESP="$(curl -fsS -X POST -H "Authorization: token ${TOKEN}" \
-            -H 'Content-Type: application/json' -d "${JSON}" \
+          RESP="$(curl -sS -X POST -H "Authorization: token ${TOKEN}" \
+            -H 'Content-Type: application/json' -d "${JSON}" -w '\nHTTP_%{http_code}' \
             "${API}/repos/${REPO}/releases")"
+          echo "POST body+code: ${RESP}" | tail -c 600
           RELEASE_ID="$(printf '%s' "${RESP}" | sed -nE 's/.*"id": *([0-9]+).*/\1/p' | head -1)"
 
           BIN="target/aarch64-apple-darwin/release/mouse-control"
