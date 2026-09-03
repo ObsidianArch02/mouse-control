@@ -1,0 +1,127 @@
+# 每次 main 分支推送都构建 macOS arm64 二进制并发布到 Gitea Release。
+# 本机 Gitea 的 runner 是 ubuntu 容器(gitea-runner-mini),没有 macOS runner,
+# 所以用 cargo-zigbuild(zig 链接器)+ macOS SDK 在 Linux 容器里交叉编译
+# aarch64-apple-darwin。SDK 来自 joseluisq/macosx-sdks 的发布附件(单文件 tarball,
+# 含公开 sha256;SDK 归属 Apple,仅用于本地开发构建)。
+#
+# Build the macOS arm64 binary on every push to main and publish it to a Gitea Release.
+# The Gitea instance's runner is an ubuntu container (gitea-runner-mini) with no macOS
+# runner, so we cross-compile aarch64-apple-darwin inside the Linux container with
+# cargo-zigbuild (zig linker) plus a macOS SDK. The SDK comes from the
+# joseluisq/macosx-sdks release assets (single-file tarball with a published sha256;
+# the SDK belongs to Apple and is used for local development builds only).
+name: release-macos-arm64
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust 工具链 + 目标平台 std。只装 minimal profile,够编译即可。
+      # Rust toolchain plus the target's std. Minimal profile is enough.
+      - name: Install Rust (aarch64-apple-darwin target)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --target aarch64-apple-darwin
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # cargo-zigbuild 内部通过 ziglang crate 自动下载匹配的 zig 编译器,无需手动装 zig。
+      # cargo-zigbuild auto-downloads a matching zig compiler via the ziglang crate.
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild --version 0.19.5
+
+      # 下载并校验 macOS SDK(SDKROOT 指它,cargo-zigbuild 才能链接 darwin framework)。
+      # Download and verify the macOS SDK (SDKROOT points at it so cargo-zigbuild can
+      # link darwin frameworks).
+      - name: Install macOS SDK
+        run: |
+          mkdir -p "$HOME/sdk" && cd "$HOME/sdk"
+          curl -fL --retry 3 -o MacOSX14.4.sdk.tar.xz \
+            https://github.com/joseluisq/macosx-sdks/releases/download/14.4/MacOSX14.4.sdk.tar.xz
+          echo "5170364da96521a8cfeb4c7b8ffa810f82bd7494bd7a93653b6054101ac6cbe7  MacOSX14.4.sdk.tar.xz" | sha256sum -c
+          tar -xf MacOSX14.4.sdk.tar.xz
+          rm MacOSX14.4.sdk.tar.xz
+
+      # 交叉编译。SDKROOT 让 zig 找到 AppKit/CoreGraphics/IOKit 等 framework;
+      # MACOSX_DEPLOYMENT_TARGET=13.0 与 README 宣称的最低系统版本一致。
+      # Cross-compile. SDKROOT lets zig find AppKit/CoreGraphics/IOKit etc.;
+      # MACOSX_DEPLOYMENT_TARGET=13.0 matches the minimum version claimed in the README.
+      - name: Build (cargo zigbuild)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: |
+          # SDK 装在 $HOME/sdk,显式设置 SDKROOT 让 zig 找到 framework。
+          # The SDK lives in $HOME/sdk; SDKROOT is set explicitly so zig finds the frameworks.
+          export SDKROOT="$HOME/sdk/MacOSX14.4.sdk"
+          cargo zigbuild --release --locked --target aarch64-apple-darwin
+
+      # 发布到 Gitea Release。每次 main 推送用 v<版本>-<sha7> 作标签,保证唯一;
+      # 若同标签已存在(重跑同一提交)先删旧 release 与标签再重建,幂等。
+      # Publish to a Gitea Release. Each main push gets a unique tag
+      # v<version>-<sha7>; if the tag already exists (re-run of the same commit),
+      # delete the old release and tag first, so this step is idempotent.
+      - name: Publish release
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="${GITHUB_API_URL}"
+          REPO="${GITHUB_REPOSITORY}"
+          SHA7="${GITHUB_SHA:0:7}"
+          VERSION="$(sed -nE 's/^version *= *"([^"]+)".*/\1/p' Cargo.toml | head -1)"
+          TAG="v${VERSION}-${SHA7}"
+          SUBJECT="$(git log -1 --pretty=%s)"
+          # JSON 转义:提交标题可能含引号或反斜杠。
+          # JSON-escape: the commit subject may contain quotes or backslashes.
+          SUBJECT_ESC="$(printf '%s' "$SUBJECT" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+          COMMIT_URL="${GITHUB_SERVER_URL}/${REPO}/commit/${GITHUB_SHA}"
+          NAME="mouse-control ${VERSION} (${SHA7})"
+
+          # 已存在的同标签 release 先删(连带标签),保持幂等。
+          # Delete a pre-existing release of the same tag (and its tag) for idempotency.
+          EXISTING_ID="$(curl -fsSL -H "Authorization: token ${TOKEN}" \
+            "${API}/repos/${REPO}/releases/tags/${TAG}" \
+            | sed -nE 's/.*"id": *([0-9]+).*/\1/p' | head -1 || true)"
+          if [ -n "${EXISTING_ID}" ]; then
+            curl -fsS -X DELETE -H "Authorization: token ${TOKEN}" \
+              "${API}/repos/${REPO}/releases/${EXISTING_ID}"
+            curl -fsS -X DELETE -H "Authorization: token ${TOKEN}" \
+              "${API}/repos/${REPO}/tags/${TAG}"
+            echo "Removed pre-existing release ${TAG}"
+          fi
+
+          BODY="Auto build from ${SHA7}: ${SUBJECT_ESC}
+
+Commit: ${COMMIT_URL}"
+          JSON="$(printf '{"tag_name":"%s","target_commitish":"%s","name":"%s","body":"%s"}' \
+            "${TAG}" "${GITHUB_SHA}" "${NAME}" "${BODY}")"
+          RESP="$(curl -fsS -X POST -H "Authorization: token ${TOKEN}" \
+            -H 'Content-Type: application/json' -d "${JSON}" \
+            "${API}/repos/${REPO}/releases")"
+          RELEASE_ID="$(printf '%s' "${RESP}" | sed -nE 's/.*"id": *([0-9]+).*/\1/p' | head -1)"
+
+          BIN="target/aarch64-apple-darwin/release/mouse-control"
+          test -x "${BIN}"
+
+          # 校验产物架构,防止工具链变化时悄悄产出错误二进制。
+          # Verify the artifact architecture so a toolchain change cannot silently
+          # produce the wrong binary.
+          file "${BIN}" | grep -q 'aarch64'
+
+          curl -fsS -X POST -H "Authorization: token ${TOKEN}" \
+            -H 'Content-Type: application/octet-stream' \
+            --data-binary "@${BIN}" \
+            "${API}/repos/${REPO}/releases/${RELEASE_ID}/assets?name=mouse-control-darwin-arm64"
+
+          sha256sum "${BIN}" > mouse-control-darwin-arm64.sha256
+          curl -fsS -X POST -H "Authorization: token ${TOKEN}" \
+            -H 'Content-Type: text/plain' \
+            --data-binary "@mouse-control-darwin-arm64.sha256" \
+            "${API}/repos/${REPO}/releases/${RELEASE_ID}/assets?name=mouse-control-darwin-arm64.sha256"
+
+          echo "Released ${TAG} -> ${GITHUB_SERVER_URL}/${REPO}/releases/tag/${TAG}"
