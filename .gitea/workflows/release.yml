@@ -114,14 +114,17 @@ jobs:
           git tag -f "${TAG}" "${GITHUB_SHA}"
           git push --force -q "${REMOTE}" "refs/tags/${TAG}:refs/tags/${TAG}"
 
-          BODY="Auto build from ${SHA7}: ${SUBJECT_ESC}"$'\n'$'\n'"Commit: ${COMMIT_URL}"
+          # body 保持单行:JSON 字符串里的换行必须转义,直接拼 $'\n' 会 422。
+          # Keep the body single-line: newlines inside JSON strings must be escaped and a
+          # raw $'\n' would 422.
+          BODY="Auto build from ${SHA7}: ${SUBJECT_ESC}. Commit: ${COMMIT_URL}"
           JSON="$(printf '{"tag_name":"%s","name":"%s","body":"%s"}' \
             "${TAG}" "${NAME}" "${BODY}")"
-          RESP="$(curl -sS -X POST -H "Authorization: token ${TOKEN}" \
-            -H 'Content-Type: application/json' -d "${JSON}" -w '\nHTTP_%{http_code}' \
+          RESP="$(curl -fsS -X POST -H "Authorization: token ${TOKEN}" \
+            -H 'Content-Type: application/json' -d "${JSON}" \
             "${API}/repos/${REPO}/releases")"
-          echo "POST body+code: ${RESP}" | tail -c 600
           RELEASE_ID="$(printf '%s' "${RESP}" | sed -nE 's/.*"id": *([0-9]+).*/\1/p' | head -1)"
+          test -n "${RELEASE_ID}"
 
           BIN="target/aarch64-apple-darwin/release/mouse-control"
           test -x "${BIN}"
