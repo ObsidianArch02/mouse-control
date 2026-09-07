@@ -28,6 +28,10 @@ pub struct Config {
 /// iPhone Mirroring).
 pub(crate) const MAX_LINE_COUNT: u32 = 20;
 
+/// Line 模式 line_height(像素/行)的上限。
+/// Upper bound of line_height (pixels per line) in Line mode.
+pub(crate) const MAX_LINE_HEIGHT: u32 = 100;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LoggingSection {
@@ -119,6 +123,12 @@ pub struct MouseProfile {
     // Line 模式每格行数(1..=MAX_LINE_COUNT)。
     // Line mode lines per notch (1..=MAX_LINE_COUNT).
     pub line_count: Option<u32>,
+    // Line 模式一行对应的像素量(1..=MAX_LINE_HEIGHT)。缺省 = 系统的行→像素换算;
+    // 配置后 Line 模式改发像素单位离散事件,一次滚动 = line_count x line_height 像素。
+    // Pixel height of one line in Line mode (1..=MAX_LINE_HEIGHT). Absent = the system's
+    // line-to-pixel conversion; when set, Line mode posts pixel-unit discrete events with
+    // line_count x line_height pixels per notch.
+    pub line_height: Option<u32>,
     pub pointer: Option<PartialPointerSection>,
     // 侧键映射:按钮号字符串 "3"/"4" -> 键盘动作串(如 "ctrl+left")。
     // 按住侧键 = 按下目标键,松开 = 释放;不自动重复。未写本字段时继承下层档,
@@ -223,6 +233,19 @@ impl Config {
                         &[("value", &lc.to_string())],
                     );
                     errs.push(format!("{prefix}.line_count: {msg}"));
+                }
+            }
+            // line_height 越界同样按无效字段处理(整档丢弃)。错误直接写英文:本任务
+            // 不新增 locale 键,且错误最终只进日志,面向开发者。
+            // Out-of-range line_height is treated as an invalid field too (whole profile
+            // dropped). The error is plain English: no new locale key in this task, and it
+            // only reaches developer-facing logs.
+            if let Some(lh) = p.line_height {
+                if !(1..=MAX_LINE_HEIGHT).contains(&lh) {
+                    errs.push(format!(
+                        "{prefix}.line_height: {} must be 1..={MAX_LINE_HEIGHT}",
+                        lh
+                    ));
                 }
             }
             // button_map 逐条校验:非法 action 只报该条错误(不会因此丢弃整个档,
@@ -523,6 +546,78 @@ line_count = 5
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.mouse.profiles[0].line_count, Some(15));
+    }
+
+    #[test]
+    fn line_height_valid_range_and_toml_roundtrip() {
+        let raw = r#"
+[mouse]
+enabled = false
+
+[[mouse.profiles]]
+line_count = 2
+line_height = 24
+
+[[mouse.profiles]]
+app_bundle_id = "com.apple.Notes"
+line_count = 2
+line_height = 24
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.validate().is_empty());
+        assert_eq!(cfg.mouse.profiles[0].line_height, Some(24));
+
+        // 边界值 1 和 100 合法。
+        // Boundary values 1 and 100 are valid.
+        let mut cfg_bounds = Config::default();
+        cfg_bounds.mouse.profiles.clear();
+        cfg_bounds.mouse.profiles.push(MouseProfile {
+            line_height: Some(1),
+            ..Default::default()
+        });
+        cfg_bounds.mouse.profiles.push(MouseProfile {
+            line_height: Some(crate::config::MAX_LINE_HEIGHT),
+            ..Default::default()
+        });
+        assert!(cfg_bounds.validate().is_empty());
+
+        // 缺省时不序列化 line_height(与 line_count 同风格)。
+        // line_height is not serialized when absent (same style as line_count).
+        let mut cfg_absent = Config::default();
+        cfg_absent.mouse.profiles.clear();
+        cfg_absent.mouse.profiles.push(MouseProfile {
+            reverse_scroll: Some(true),
+            ..Default::default()
+        });
+        let toml_str = toml::to_string_pretty(&cfg_absent).unwrap();
+        assert!(!toml_str.contains("line_height"));
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.mouse.profiles[0].line_height, None);
+    }
+
+    #[test]
+    fn line_height_out_of_range_drops_profile() {
+        let raw = r#"
+[mouse]
+enabled = false
+
+[[mouse.profiles]]
+reverse_scroll = true
+line_count = 2
+line_height = 101
+"#;
+        let loaded: Config = toml::from_str(raw).unwrap();
+        let errs = loaded.validate();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].starts_with("mouse.profiles[0].line_height"));
+
+        // 非法字段所在档整体丢弃,回退默认档。
+        // The profile with the invalid field is dropped; the default profile remains.
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errs);
+        assert_eq!(merged.mouse.profiles.len(), 1);
+        assert_eq!(merged.mouse.profiles[0].line_height, None);
+        assert_eq!(merged.mouse.profiles[0].line_count, Some(3));
     }
 
     #[test]

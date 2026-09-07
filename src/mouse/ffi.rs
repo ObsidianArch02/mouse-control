@@ -116,6 +116,13 @@ extern "C" {
     // (matching events to the producing device for per-device config).
     pub(crate) fn CGEventCopyIOHIDEvent(event: CGEventRef) -> *mut c_void;
 
+    // 读事件坐标(全局显示坐标:主屏左上原点,y 向下,与 kCGWindowBounds 同一坐标系)。
+    // 用于滚动事件的"光标下窗口" app 归因。
+    // Event location in global display coordinates (origin at the main display's top-left,
+    // y down; the same space as kCGWindowBounds). Used for window-under-cursor app
+    // attribution of scroll events.
+    pub(crate) fn CGEventGetLocation(event: CGEventRef) -> CGPointFFI;
+
     // 合成全新的滚轮事件。source 传 null 表示用默认 source;wheelCount 通常为 2
     // (wheel1=垂直,wheel2=水平)。
     // Create a brand-new scroll wheel event. source=null for the default source; wheelCount is
@@ -156,6 +163,101 @@ extern "C" {
     pub(crate) fn CFRunLoopStop(rl: CFRunLoopRef);
 
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
+}
+
+// ========== 窗口归因 FFI / window attribution FFI ==========
+// 滚动事件的 app 归因按"光标下的窗口"进行(macOS 把滚轮派发给光标下的窗口,不是
+// key window)。CGWindowListCopyWindowInfo 枚举屏幕上的窗口(顺序为从前往后),
+// 每个元素是 CFDictionary,键为 kCGWindow* 常量。
+// Scroll events attribute the app by "the window under the cursor" (macOS dispatches
+// wheel events to the window under the pointer, not the key window).
+// CGWindowListCopyWindowInfo enumerates on-screen windows front-to-back; each element is
+// a CFDictionary keyed by the kCGWindow* constants.
+
+/// CGWindowListCopyWindowInfo 选项:只取屏幕上的窗口。
+/// CGWindowListCopyWindowInfo option: on-screen windows only.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+/// CGWindowListCopyWindowInfo 选项:排除桌面元素(桌面图标窗口)。
+/// CGWindowListCopyWindowInfo option: exclude desktop elements (desktop icon windows).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+
+/// CFNumberType 的 kCFNumberIntType = 9(枚举常量不是导出符号,直接用值)。
+/// CFNumberType kCFNumberIntType = 9 (an enum constant, not an exported symbol; raw value).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const K_CF_NUMBER_INT_TYPE: isize = 9;
+
+/// 按值传递的 CGPoint(f64 x/y)。
+/// CGPoint passed by value (f64 x/y).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct CGPointFFI {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// 按值传递的 CGSize(f64 width/height)。
+/// CGSize passed by value (f64 width/height).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct CGSizeFFI {
+    pub width: f64,
+    pub height: f64,
+}
+
+/// 按值传递的 CGRect(origin + size)。
+/// CGRect passed by value (origin + size).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct CGRectFFI {
+    pub origin: CGPointFFI,
+    pub size: CGSizeFFI,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    // 枚举屏幕上的窗口,返回 CFArrayRef(CFDictionary 数组,+1 由调用方 CFRelease)。
+    // 参数 2(relativeToWindow)在不指定参照窗口时传 0。
+    // On-screen window list as a CFArrayRef of CFDictionarys (+1 owned; caller CFReleases).
+    // Pass 0 for relativeToWindow when no reference window is needed.
+    pub(crate) fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32)
+    -> *const c_void;
+
+    // 从 kCGWindowBounds 字典还原 CGRect(失败返回 false)。
+    // Restore a CGRect from a kCGWindowBounds dictionary (false on failure).
+    pub(crate) fn CGRectMakeWithDictionaryRepresentation(
+        dict: *const c_void,
+        rect: *mut CGRectFFI,
+    ) -> bool;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    // CF 字典按键取值(借用,不持有)。
+    // Borrowed value lookup in a CF dictionary (not owned).
+    pub(crate) fn CFDictionaryGetValue(
+        the_dict: *const c_void,
+        key: *const c_void,
+    ) -> *const c_void;
+
+    // 读 CFNumber(成功返回 true 并写入 value)。
+    // Read a CFNumber (returns true and writes value on success).
+    pub(crate) fn CFNumberGetValue(
+        number: *const c_void,
+        the_type: isize,
+        value: *mut c_void,
+    ) -> bool;
+
+    // 窗口字典键:属主 PID、frame(kCGWindowBounds 是嵌套字典)、窗口层。
+    // Window dictionary keys: owner PID, frame (kCGWindowBounds is a nested dictionary),
+    // window layer.
+    pub(crate) static kCGWindowOwnerPID: CFStringRef;
+    pub(crate) static kCGWindowBounds: CFStringRef;
+    pub(crate) static kCGWindowLayer: CFStringRef;
 }
 
 // ========== 通用 tap 创建流程 / generic tap-creation flow ==========
@@ -440,6 +542,11 @@ pub(crate) const K_CG_HID_EVENT_TAP: i32 = 0;
 /// CGEventCreateScrollWheelEvent2 的 units:kCGScrollEventUnitLine=1(行级,离散滚动)。
 /// CGEventCreateScrollWheelEvent2 units: kCGScrollEventUnitLine=1 (line-level, discrete scroll).
 pub(crate) const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
+
+/// kCGScrollEventUnitPixel=2(像素级,离散滚动;line_height 模式用)。
+/// kCGScrollEventUnitPixel=2 (pixel-level, discrete scroll; used by the line_height mode).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 2;
 
 /// eventSourceUserData 字段(field 42)。用于在合成事件上打标记,防止自己的 tap 无限循环。
 /// eventSourceUserData field (field 42). Used to tag synthetic events so our own tap can
