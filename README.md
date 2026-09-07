@@ -14,7 +14,9 @@ menu-bar icon, because the agent runs inside the user's GUI session.
 ## Features
 
 - **Reverse scrolling** — flip the wheel direction relative to the system's current setting.
-- **Line scrolling** — turn each wheel notch into a fixed number of lines.
+- **Line scrolling** — turn each wheel notch into a fixed number of lines; an optional
+  `line_height` (pixels per line) switches line mode to pixel-unit events so the travel per
+  notch is app-independent.
 - **Continuous scrolling** — emit trackpad-style pixel scroll events for apps that behave
   poorly with discrete wheel events (for example iPhone Mirroring).
 - **Disable pointer acceleration** — 1:1 linear cursor tracking (macOS 14+ linear-scaling
@@ -24,9 +26,11 @@ menu-bar icon, because the agent runs inside the user's GUI session.
   it releases; no auto-repeat.
 - **Per-device profiles** — match devices by VID+PID; each device can have its own settings,
   merged over an "All Mice" default profile (more specific profiles win).
-- **Per-app overrides** — add `app_bundle_id` or `app_name` to a profile so it only applies
-  while that app is frontmost; a combined device + app profile overrides both device-only and
-  app-only profiles.
+- **Per-app overrides** — add `app_bundle_id` or `app_name` to a profile so it applies to
+  that app; a combined device + app profile overrides both device-only and app-only
+  profiles. Scroll events are attributed to the app owning the **window under the cursor**
+  (falling back to the frontmost app), so a per-app profile also applies when you scroll an
+  unfocused window of that app without activating it first.
 - **Hot toggle & hot reload** — enable/disable from the menu (persisted to config), or edit
   the TOML and choose *Reload Config*; no restart needed.
 - **Bluetooth resilience** — device plug/unplug is monitored, so the attribution chain
@@ -112,6 +116,11 @@ button_map = { "3" = "cmd+[" }
 app_bundle_id = "com.apple.ScreenContinuity"
 scroll_mode = "continuous"
 
+[[mouse.profiles]]              # per-app example: Notes needs more travel per notch
+app_bundle_id = "com.apple.Notes"
+line_count = 2
+line_height = 24                # pixels per line (1..=100); line mode only
+
 [[mouse.profiles]]              # optional app + device override profile
 app_name = "Google Chrome"
 device_vendor_id = 1133
@@ -131,6 +140,13 @@ may match. Invalid fields (bad `scroll_mode`, `line_count` out of range) are res
 with a logged error — the app never refuses to start. To find a device's VID:PID, enable debug
 logging and watch the `[mouse] scroll dev=` line in the log, or use
 `system_profiler SPUSBDataType`.
+
+`line_height` (absent by default, valid range 1..=100) customizes how many pixels one line
+covers in line mode. It only takes effect in line mode: when set, the app posts pixel-unit
+wheel events with `line_count × line_height` pixels per notch, so the travel per notch no
+longer depends on each app's own line-to-pixel conversion (some apps, like Notes, convert one
+line to very few pixels). Without `line_height`, line mode posts ordinary line-unit events as
+before.
 
 ### Side-button actions (`button_map`)
 

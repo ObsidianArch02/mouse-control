@@ -11,24 +11,25 @@
 //! approach: drop the original, post a new event to the session level, bypassing the system
 //! natural-scroll override at the HID layer.
 
-use crate::app;
+use crate::app::{self, AppIdentity};
 use crate::ffi::CFRelease;
 use crate::mouse::buttons;
 use crate::mouse::device;
 use crate::mouse::ffi::{
     self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent, CGEventCreate,
     CGEventCreateScrollWheelEvent2, CGEventFlags, CGEventGetFlags, CGEventGetIntegerValueField,
-    CGEventMask, CGEventPost, CGEventRef, CGEventSetFlags, CGEventSetIntegerValueField,
-    CGEventTapProxy, CGEventType, K_CG_EVENT_SOURCE_USER_DATA, K_CG_EVENT_TYPE,
-    K_CG_SCROLL_EVENT_UNIT_LINE, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
-    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
-    K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
-    K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
-    K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
+    CGEventGetLocation, CGEventMask, CGEventPost, CGEventRef, CGEventSetFlags,
+    CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, K_CG_EVENT_SOURCE_USER_DATA,
+    K_CG_EVENT_TYPE, K_CG_SCROLL_EVENT_UNIT_LINE, K_CG_SCROLL_EVENT_UNIT_PIXEL,
+    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+    K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
+    K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+    K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
 };
 use crate::mouse::resolve;
-use crate::mouse::scrolling::{compute_continuous_delta, compute_delta, ScrollMode};
+use crate::mouse::scrolling::{compute_continuous_delta, compute_delta, ScrollMode, ScrollUnit};
 use crate::{log_debug, log_info};
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -51,13 +52,18 @@ const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
 
 /// 合成一个滚轮事件并 post 到 session 层。
-/// 行模式按"行"单位 post;默认模式透传原 delta。
+/// 单位由 ScrollUnit 决定:行单位(缺省/默认模式)或像素单位(line_height 模式);
+/// 默认模式透传原 delta。
 ///
 /// Synthesize a scroll event and post it to the session level.
-/// Line mode posts in "line" units; Default mode passes the raw delta through.
-unsafe fn post_scroll_event(dy: i32, dx: i32, flags: CGEventFlags) {
-    let synthetic =
-        CGEventCreateScrollWheelEvent2(std::ptr::null(), K_CG_SCROLL_EVENT_UNIT_LINE, 2, dy, dx, 0);
+/// The unit comes from ScrollUnit: lines (absent line_height / default mode) or pixels
+/// (the line_height mode); Default mode passes the raw delta through.
+unsafe fn post_scroll_event(dy: i32, dx: i32, units: ScrollUnit, flags: CGEventFlags) {
+    let unit = match units {
+        ScrollUnit::Line => K_CG_SCROLL_EVENT_UNIT_LINE,
+        ScrollUnit::Pixel => K_CG_SCROLL_EVENT_UNIT_PIXEL,
+    };
+    let synthetic = CGEventCreateScrollWheelEvent2(std::ptr::null(), unit, 2, dy, dx, 0);
 
     if synthetic.is_null() {
         log_info!("[mouse] failed to synthesize scroll event");
@@ -207,6 +213,34 @@ fn log_button_event_diag(
     }
 }
 
+thread_local! {
+    /// 滚动归因缓存:取整光标坐标 -> 光标下窗口的 app 身份(含 None)。滚动爆发期间
+    /// 光标几乎静止,坐标不变就复用上次查询,把窗口枚举从"每个滚轮事件一次"降到
+    /// "每次坐标变化一次"。只在鼠标线程使用。
+    /// Scroll attribution cache: rounded cursor position -> app identity of the window
+    /// under it (None included). The cursor barely moves during a scroll burst; an
+    /// unchanged position reuses the last lookup, dropping window enumeration from once
+    /// per wheel event to once per position change. Mouse thread only.
+    static CURSOR_APP: RefCell<((i32, i32), Option<AppIdentity>)> = const {
+        RefCell::new(((i32::MIN, i32::MIN), None))
+    };
+}
+
+/// 光标下窗口的 app 身份(带坐标缓存)。hit-test 在 app.rs,这里只做缓存。
+/// App identity of the window under the cursor (position-cached). The hit-test lives in
+/// app.rs; this wrapper only caches.
+fn scroll_app_at_cursor(x: f64, y: f64) -> Option<AppIdentity> {
+    let key = (x.round() as i32, y.round() as i32);
+    CURSOR_APP.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        if slot.0 != key {
+            slot.0 = key;
+            slot.1 = app::identity_at_point(x, y);
+        }
+        slot.1.clone()
+    })
+}
+
 unsafe extern "C" fn mouse_event_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
@@ -249,23 +283,34 @@ unsafe extern "C" fn mouse_event_tap_callback(
             (raw_point_dy, raw_point_dx)
         };
 
-        // 归因:CGEvent -> 产生事件的设备 -> (VID,PID)。失败返回 None(回退"所有鼠标"档)。
-        // Attribution: CGEvent -> producing device -> (VID, PID). None on failure (falls back to
-        // the "All Mice" profile).
+        // app 归因:按"光标下的窗口"找 app(macOS 把滚轮派发给光标下的窗口,不是
+        // key window;只看前台 app 在不激活直接滚失焦窗口时永不命中),hit-test 失败
+        // 回退前台 app,保持原有行为。
+        // App attribution: resolve the app from the window under the cursor (macOS
+        // dispatches wheel events to the window under the pointer, not the key window;
+        // the frontmost app alone never hits when scrolling an unfocused window without
+        // activating it). Fall back to the frontmost app on a hit-test miss, preserving
+        // the previous behavior.
+        let loc = CGEventGetLocation(event);
+        let app_key = scroll_app_at_cursor(loc.x, loc.y).or_else(app::active_identity);
+        // 设备归因:CGEvent -> 产生事件的设备 -> (VID,PID)。失败返回 None(回退"所有鼠标"档)。
+        // Device attribution: CGEvent -> producing device -> (VID, PID). None on failure
+        // (falls back to the "All Mice" profile).
         let dev_key = device::device_from_cgevent(event);
-        // 解析该设备 + 当前前台 app 的生效配置(合并全局档 + 设备档 + app 档)。
-        // Resolve the effective config for this device and the current frontmost app (merging
-        // global + per-device + per-app profiles).
-        let app_key = app::active_identity();
+        // 解析该设备 + 光标下窗口 app 的生效配置(合并全局档 + 设备档 + app 档)。
+        // Resolve the effective config for this device and the window-under-cursor app
+        // (merging global + per-device + per-app profiles).
         let resolved = resolve::resolve(dev_key, app_key.clone());
 
         // 归因诊断放最前,与普通滚动日志区分开,便于排查 per-device 设置不生效。
         // Attribution diagnostics lead the line, distinguishing it from plain scroll logs so
         // per-device settings not applying is easy to spot.
         log_debug!(
-            "[mouse] scroll dev={:?} app={:?} dy={} dx={} flags=0x{:x} reverse={}",
+            "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} flags=0x{:x} reverse={}",
             dev_key,
             app_key,
+            loc.x,
+            loc.y,
             dy,
             dx,
             flags,
@@ -281,8 +326,8 @@ unsafe extern "C" fn mouse_event_tap_callback(
             let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, &resolved);
             post_continuous_scroll_event(ndy, ndx, flags);
         } else {
-            let (ndy, ndx) = compute_delta(dy, dx, &resolved);
-            post_scroll_event(ndy, ndx, flags);
+            let (ndy, ndx, unit) = compute_delta(dy, dx, &resolved);
+            post_scroll_event(ndy, ndx, unit, flags);
         }
         std::ptr::null_mut()
     } else if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN || event_type == K_CG_EVENT_OTHER_MOUSE_UP {

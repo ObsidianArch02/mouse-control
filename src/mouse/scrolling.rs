@@ -37,6 +37,15 @@ pub(crate) enum ScrollMode {
     Continuous,
 }
 
+/// 离散滚轮事件的单位:行(系统的行→像素换算)或像素(line_height 配置,修"单行偏短")。
+/// Unit for discrete scroll wheel events: lines (the system's line-to-pixel conversion) or
+/// pixels (the line_height config, fixing "short single lines").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollUnit {
+    Line,
+    Pixel,
+}
+
 impl ScrollMode {
     pub(crate) fn from_str(s: &str) -> Self {
         match s {
@@ -69,30 +78,52 @@ impl ScrollMode {
     }
 }
 
-/// 根据解析后的配置计算要 post 的滚动 delta。
-/// 处理反转 + 行模式的行数归一化。结果形参供 post_scroll_event 使用。
+/// 根据解析后的配置计算要 post 的滚动 delta 与事件单位。
+/// 处理反转 + 行模式的行数归一化;行模式配置了 line_height 时改发像素单位事件,
+/// delta = line_count x line_height(系统的行→像素换算偏小,单行体感偏短)。
 ///
-/// Compute the scroll delta to post from the resolved config.
-/// Handles reversal + line-mode normalization.
+/// Compute the scroll delta and event unit to post from the resolved config.
+/// Handles reversal + line-mode normalization; when line_height is set in line mode the
+/// event switches to pixel units with delta = line_count x line_height (the system's
+/// line-to-pixel conversion is too small, making a single line feel short).
 pub(crate) fn compute_delta(
     dy: i64,
     dx: i64,
     r: &crate::mouse::resolve::ResolvedMouse,
-) -> (i32, i32) {
+) -> (i32, i32, ScrollUnit) {
     let mode = r.scroll_mode;
     let flip = should_flip(r.reverse_scroll);
 
-    let (mut ndy, mut ndx) = match mode {
-        ScrollMode::Default => (dy as i32, dx as i32),
+    let (mut ndy, mut ndx, unit) = match mode {
+        ScrollMode::Default => (dy as i32, dx as i32, ScrollUnit::Line),
         ScrollMode::Line => {
-            let line_count = r.line_count.clamp(1, crate::config::MAX_LINE_COUNT) as i64;
             let sign_y = if dy != 0 { dy.signum() } else { 0 };
             let sign_x = if dx != 0 { dx.signum() } else { 0 };
-            ((sign_y * line_count) as i32, (sign_x * line_count) as i32)
+            match r.line_height {
+                // 像素模式:一次滚动 = 行数 x 像素/行。
+                // Pixel mode: one notch = line_count x line_height pixels.
+                Some(h) => {
+                    let magnitude = (r.line_count.clamp(1, crate::config::MAX_LINE_COUNT) as i64
+                        * h.clamp(1, crate::config::MAX_LINE_HEIGHT) as i64) as i32;
+                    (
+                        (sign_y * magnitude as i64) as i32,
+                        (sign_x * magnitude as i64) as i32,
+                        ScrollUnit::Pixel,
+                    )
+                }
+                None => {
+                    let line_count = r.line_count.clamp(1, crate::config::MAX_LINE_COUNT) as i64;
+                    (
+                        (sign_y * line_count) as i32,
+                        (sign_x * line_count) as i32,
+                        ScrollUnit::Line,
+                    )
+                }
+            }
         }
         // 连续模式由 event_tap 单独读取 point delta 后合成,这里保留透传兜底。
         // Continuous mode reads point deltas separately in event_tap; keep passthrough here.
-        ScrollMode::Continuous => (dy as i32, dx as i32),
+        ScrollMode::Continuous => (dy as i32, dx as i32, ScrollUnit::Line),
     };
 
     if flip {
@@ -100,7 +131,7 @@ pub(crate) fn compute_delta(
         ndx = -ndx;
     }
 
-    (ndy, ndx)
+    (ndy, ndx, unit)
 }
 
 /// 连续滚动模式下的像素 delta 计算:只应用用户反转开关,不套用 line_count。
@@ -150,5 +181,39 @@ mod tests {
 
         r.reverse_scroll = true;
         assert_eq!(compute_continuous_delta(3, 4, &r), (-3, -4));
+    }
+
+    #[test]
+    fn line_mode_without_line_height_keeps_line_units() {
+        let r = |reverse: bool| crate::mouse::resolve::ResolvedMouse {
+            scroll_mode: ScrollMode::Line,
+            line_count: 3,
+            reverse_scroll: reverse,
+            ..Default::default()
+        };
+        assert_eq!(compute_delta(1, 0, &r(false)), (3, 0, ScrollUnit::Line));
+        // 反转开关继续生效。
+        // The reverse toggle still applies.
+        assert_eq!(compute_delta(1, 0, &r(true)), (-3, 0, ScrollUnit::Line));
+    }
+
+    #[test]
+    fn line_mode_with_line_height_uses_pixel_units() {
+        let r = |reverse: bool| crate::mouse::resolve::ResolvedMouse {
+            scroll_mode: ScrollMode::Line,
+            line_count: 2,
+            line_height: Some(24),
+            reverse_scroll: reverse,
+            ..Default::default()
+        };
+        // delta = line_count x line_height,方向跟随原事件。
+        // delta = line_count x line_height, direction follows the original event.
+        assert_eq!(compute_delta(1, 0, &r(false)), (48, 0, ScrollUnit::Pixel));
+        assert_eq!(compute_delta(-1, 0, &r(false)), (-48, 0, ScrollUnit::Pixel));
+        assert_eq!(compute_delta(0, 1, &r(false)), (0, 48, ScrollUnit::Pixel));
+
+        // 反转开关继续生效。
+        // The reverse toggle still applies.
+        assert_eq!(compute_delta(1, 0, &r(true)), (-48, 0, ScrollUnit::Pixel));
     }
 }

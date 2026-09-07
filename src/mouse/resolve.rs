@@ -26,6 +26,12 @@ pub(crate) struct ResolvedMouse {
     pub reverse_scroll: bool,
     pub scroll_mode: ScrollMode,
     pub line_count: u32,
+    /// Line 模式一行对应的像素量;None = 系统行→像素换算(发 line 单位事件)。Some 时
+    /// Line 模式改发像素单位事件,delta = line_count x line_height。
+    /// Pixel height of one line in Line mode; None = the system's line-to-pixel conversion
+    /// (line-unit events). When set, Line mode posts pixel-unit events with
+    /// delta = line_count x line_height.
+    pub line_height: Option<u32>,
     pub disable_acceleration: bool,
     /// 侧键按钮号(3/4)-> 已解析动作。命中即替换原侧键事件,未命中透传。
     /// Side-button number (3/4) -> parsed action. A hit replaces the original side-button
@@ -39,6 +45,7 @@ impl Default for ResolvedMouse {
             reverse_scroll: true,
             scroll_mode: ScrollMode::Line,
             line_count: 3,
+            line_height: None,
             disable_acceleration: true,
             // button_map 由配置档合并而来,兜底为空;默认的 3/4 映射由"所有鼠标"档提供。
             // button_map comes from merging config profiles; the fallback is empty (the
@@ -168,6 +175,7 @@ fn resolve_from(
     r.reverse_scroll = defaults.reverse_scroll;
     r.scroll_mode = defaults.scroll_mode;
     r.line_count = defaults.line_count;
+    r.line_height = defaults.line_height;
     r.disable_acceleration = defaults.disable_acceleration;
     r.button_map = defaults.button_map;
 
@@ -187,6 +195,9 @@ fn resolve_from(
             }
             if let Some(lc) = p.line_count {
                 r.line_count = lc.clamp(1, crate::config::MAX_LINE_COUNT);
+            }
+            if let Some(lh) = p.line_height {
+                r.line_height = Some(lh.clamp(1, crate::config::MAX_LINE_HEIGHT));
             }
             if let Some(ref ptr) = p.pointer {
                 if let Some(da) = ptr.disable_acceleration {
@@ -368,6 +379,60 @@ mod tests {
         assert_eq!(r2.button_map.len(), 1);
         assert!(r2.button_map.contains_key(&3));
         assert!(!r2.button_map.contains_key(&4));
+    }
+
+    #[test]
+    fn line_height_merges_by_specificity_and_order() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles.clear();
+        // 缺省:None(沿用系统行→像素换算)。
+        // Absent by default (the system's line-to-pixel conversion applies).
+        let r0 = resolve_from(&cfg, None, None);
+        assert_eq!(r0.line_height, None);
+
+        cfg.mouse.profiles.push(MouseProfile {
+            line_count: Some(2),
+            line_height: Some(24),
+            ..Default::default()
+        });
+        cfg.mouse.profiles.push(MouseProfile {
+            app_bundle_id: Some("com.apple.Notes".into()),
+            line_count: Some(3),
+            line_height: Some(16),
+            ..Default::default()
+        });
+
+        let notes = AppIdentity {
+            bundle_id: Some("com.apple.Notes".into()),
+            localized_name: Some("Notes".into()),
+        };
+        // app 档具体度更高,两个像素量字段都由它覆盖。
+        // The app profile is more specific and overrides both fields.
+        let r = resolve_from(&cfg, Some((1, 2)), Some(&notes));
+        assert_eq!(r.line_height, Some(16));
+        assert_eq!(r.line_count, 3);
+
+        let other = AppIdentity {
+            bundle_id: Some("com.google.Chrome".into()),
+            localized_name: Some("Google Chrome".into()),
+        };
+        // 其他 app 只命中全局档。
+        // Other apps only match the global profile.
+        let r2 = resolve_from(&cfg, Some((1, 2)), Some(&other));
+        assert_eq!(r2.line_height, Some(24));
+        assert_eq!(r2.line_count, 2);
+    }
+
+    #[test]
+    fn line_height_is_clamped_at_resolve() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles.clear();
+        cfg.mouse.profiles.push(MouseProfile {
+            line_height: Some(500),
+            ..Default::default()
+        });
+        let r = resolve_from(&cfg, None, None);
+        assert_eq!(r.line_height, Some(crate::config::MAX_LINE_HEIGHT));
     }
 
     #[test]

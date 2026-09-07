@@ -11,7 +11,14 @@ use crate::ffi::{
     class_addMethod, make_nsstring, nsstring_to_rust, objc_allocateClassPair,
     objc_registerClassPair, CFRelease,
 };
+use crate::mouse::ffi::{
+    CFArrayGetCount, CFArrayGetValueAtIndex, CFDictionaryGetValue, CFNumberGetValue,
+    CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGRectFFI,
+    K_CF_NUMBER_INT_TYPE, K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+    K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY, kCGWindowBounds, kCGWindowLayer, kCGWindowOwnerPID,
+};
 use crate::{log_debug, log_info};
+use objc2::rc::autoreleasepool;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use std::ffi::{c_void, CString};
@@ -95,6 +102,103 @@ unsafe fn identity_from_running_app(app: *mut AnyObject) -> AppIdentity {
     AppIdentity {
         bundle_id: optional_nsstring_to_rust(bundle),
         localized_name: optional_nsstring_to_rust(name),
+    }
+}
+
+/// 光标坐标处的 app 身份:按"光标下的窗口"归因。macOS 把滚轮事件派发给光标下的
+/// 窗口而非 key window,不点击激活直接滚失焦窗口时,前台 app 归因永不命中(issue #3);
+/// 激活后立刻滚动又可能赶上 NSWorkspace 通知未处理(issue #2 的首次滚动回滚体感)。
+/// 遍历屏幕上从前往后的窗口,取第一个普通层(layer 0)且 bounds 含点的窗口,读属主
+/// PID 对应的 NSRunningApplication,复用 identity_from_running_app。无命中(桌面/
+/// 菜单栏/Dock,或属主无 NSRunningApplication)返回 None,调用方回退前台 app 归因。
+///
+/// App identity at a cursor position: attribution by "the window under the cursor".
+/// macOS dispatches wheel events to the window under the pointer, not the key window, so
+/// frontmost-app attribution never hits when scrolling an unfocused window without
+/// activating it (issue #3), and an immediate scroll after activation can race the
+/// NSWorkspace notification (the first-scroll rollback feel of issue #2). Walks the
+/// on-screen window list front-to-back, takes the first normal-layer (layer 0) window
+/// whose bounds contain the point, and reads its owner PID's NSRunningApplication via
+/// identity_from_running_app. None when nothing matches (desktop / menu bar / Dock, or an
+/// owner without a NSRunningApplication); callers fall back to frontmost-app attribution.
+pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
+    // 鼠标线程没有 autorelease pool,查询过程产生的临时 ObjC 对象在这里统一释放。
+    // The mouse thread has no autorelease pool; temporary ObjC objects produced by the
+    // lookup are drained here.
+    autoreleasepool(|_| unsafe { identity_at_point_impl(x, y) })
+}
+
+unsafe fn identity_at_point_impl(x: f64, y: f64) -> Option<AppIdentity> {
+    let list = CGWindowListCopyWindowInfo(
+        K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+        0,
+    );
+    if list.is_null() {
+        return None;
+    }
+    let mut hit = None;
+    let count = CFArrayGetCount(list);
+    for i in 0..count {
+        let window = CFArrayGetValueAtIndex(list, i);
+        if window.is_null() {
+            continue;
+        }
+        // 只认普通窗口层(kCGWindowLayer == 0),菜单栏/Dock/浮动面板等直接跳过。
+        // Accept only the normal window layer (kCGWindowLayer == 0); skip the menu bar,
+        // Dock, floating panels, etc.
+        if read_dict_int(window, kCGWindowLayer) != Some(0) {
+            continue;
+        }
+        // bounds 缺失/无法解析的窗口跳过;含点判断用半开区间,相邻窗口拼缝处不双重命中。
+        // Skip windows with a missing/unparseable bounds; use half-open containment so
+        // abutting windows never double-hit at the seam.
+        let bounds_ptr = CFDictionaryGetValue(window, kCGWindowBounds);
+        let mut bounds = CGRectFFI::default();
+        if bounds_ptr.is_null() || !CGRectMakeWithDictionaryRepresentation(bounds_ptr, &mut bounds)
+        {
+            continue;
+        }
+        let inside = x >= bounds.origin.x
+            && x < bounds.origin.x + bounds.size.width
+            && y >= bounds.origin.y
+            && y < bounds.origin.y + bounds.size.height;
+        if !inside {
+            continue;
+        }
+        // 命中:属主 PID -> NSRunningApplication -> 现有身份提取;属主不是常规 GUI app
+        // 时继续看下一个窗口。
+        // Hit: owner PID -> NSRunningApplication -> the existing identity extraction;
+        // move on to the next window when the owner is not a regular GUI app.
+        let Some(pid) = read_dict_int(window, kCGWindowOwnerPID) else {
+            continue;
+        };
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            continue;
+        }
+        hit = Some(identity_from_running_app(app));
+        break;
+    }
+    CFRelease(list);
+    hit
+}
+
+/// 从窗口 CFDictionary 读 i32 值(kCGWindowLayer / kCGWindowOwnerPID 都是 CFNumber)。
+/// Read an i32 value from a window CFDictionary (kCGWindowLayer / kCGWindowOwnerPID are
+/// both CFNumbers).
+unsafe fn read_dict_int(dict: *const c_void, key: *const c_void) -> Option<i32> {
+    let value = CFDictionaryGetValue(dict, key);
+    if value.is_null() {
+        return None;
+    }
+    let mut out: i32 = 0;
+    if CFNumberGetValue(value, K_CF_NUMBER_INT_TYPE, &mut out as *mut i32 as *mut c_void) {
+        Some(out)
+    } else {
+        None
     }
 }
 
