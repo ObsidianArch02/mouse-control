@@ -6,6 +6,10 @@
 //!   by_registry_id 查表 -> Device
 //! 失败时惰性重枚举一次;仍失败则回退到 last_active(匹配"所有鼠标"档)。
 //!
+//! 插拔/重枚举线程模型:IOHIDManager 回调只做信号转发,重枚举在专用 worker 线程
+//! 执行。重建 client 的 30ms settle 与设备列表构建全程不持 REGISTRY 锁,只在整体
+//! 交换新状态时短时持锁,鼠标线程的归因路径持锁时间从 30ms+ 降到微秒级。
+//!
 //! Live device registry + CGEvent -> producing-device attribution chain (Phase 0+1).
 //!
 //! Attribution chain (private SPI, mirroring LinearMouse):
@@ -14,6 +18,12 @@
 //!   by_registry_id lookup -> Device
 //! On failure, lazily re-enumerate once; if still failing, fall back to last_active
 //! (which matches the "All Mice" profile).
+//!
+//! Plug/re-enumeration threading model: the IOHIDManager callback only forwards a signal, and
+//! re-enumeration runs on a dedicated worker thread. The 30ms settle of a client rebuild and
+//! the device-list build happen entirely outside the REGISTRY lock; only the final swap of the
+//! whole state takes the lock briefly, so the mouse thread's attribution path holds the lock
+//! for microseconds instead of 30ms+.
 
 use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
 use crate::mouse::ffi::*;
@@ -21,7 +31,7 @@ use crate::{log_debug, log_info};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 // ========== 设备身份与运行时表示 / device identity & runtime handle ==========
 
@@ -85,10 +95,10 @@ unsafe impl Sync for DeviceRegistry {}
 static REGISTRY: OnceLock<Mutex<DeviceRegistry>> = OnceLock::new();
 
 /// 鼠标线程的 CFRunLoop(由 start_plug_monitor 记录)。注册表 client 要调度到这个
-/// runloop 匹配才会常驻(见 enumerate_locked);enumeration 可能先于插拔监听执行,
+/// runloop 匹配才会常驻(见 build_state);enumeration 可能先于插拔监听执行,
 /// 故用运行时读取而非启动时一次性传入。裸指针用 Send+Sync 包装(与 ManagerMutex 同款)。
 /// The mouse thread's CFRunLoop (recorded by start_plug_monitor). The registry client must be
-/// scheduled on it for matching to stay live (see enumerate_locked); enumeration can run before
+/// scheduled on it for matching to stay live (see build_state); enumeration can run before
 /// the plug monitor starts, so the value is read at runtime, not passed in once at startup.
 /// The raw pointer is wrapped with Send+Sync (same pattern as ManagerMutex).
 struct RunloopMutex(Mutex<Option<crate::mouse::ffi::CFRunLoopRef>>);
@@ -156,83 +166,87 @@ unsafe fn prop_string(service: *mut c_void, key: &str) -> String {
 
 // ========== 枚举 / enumeration ==========
 
-/// 枚举当前已连接的鼠标/触控板设备,填充注册表。
-/// 调用方持有 REGISTRY 锁。rebuild_client = true 时强制重建 IOHIDEventSystemClient
-/// (蓝牙设备休眠断连重连后,旧 client 的注册表缓存过期,导致归因链失效——见
-/// device_from_cgevent 的失败路径)。
+/// 一次枚举产出的完整注册表状态(锁外构建,随后短时持锁整体交换)。
+/// A complete registry state produced by one enumeration pass (built outside the lock, then
+/// swapped in as a whole under a brief lock).
+struct RegistryState {
+    client: *mut c_void,
+    services: *mut c_void,
+    devices: Vec<Device>,
+}
+
+/// 构建一份全新的注册表状态:新建 IOHIDEventSystemClient、等匹配 settle、调度到鼠标
+/// 线程 runloop、拷贝 services 并过滤指针设备。全程不持 REGISTRY 锁(含 30ms sleep);
+/// 调用方随后用 swap_state 短时持锁交换。构建失败时返回 client 为空的状态,旧注册表
+/// 原样保留(重建期间旧状态继续服务归因,交换后旧 client/services 才释放)。
 ///
-/// Enumerate currently-connected mouse/trackpad devices and populate the registry.
-/// Caller holds the REGISTRY lock. With rebuild_client = true, the IOHIDEventSystemClient is
-/// forcibly recreated (after a Bluetooth disconnect/reconnect the old client's registry cache is
-/// stale, breaking the attribution chain -- see the failure path in device_from_cgevent).
-unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
-    // 释放旧的 services 数组(若有)。
-    // Release the previous services array (if any).
-    if !reg.services.is_null() {
-        CFRelease(reg.services as *const c_void);
-        reg.services = std::ptr::null_mut();
+/// Build a brand-new registry state: create a fresh IOHIDEventSystemClient, wait for matching
+/// to settle, schedule it on the mouse thread's runloop, copy services and filter pointer
+/// devices. The REGISTRY lock is never held (including the 30ms sleep); the caller swaps the
+/// result in with swap_state under a brief lock. On failure the returned state has a null
+/// client and the old registry is left untouched (the old state keeps serving attribution
+/// during the rebuild; the old client/services are only released after the swap).
+unsafe fn build_state() -> RegistryState {
+    let mut state = RegistryState {
+        client: std::ptr::null_mut(),
+        services: std::ptr::null_mut(),
+        devices: Vec::new(),
+    };
+    // 一律新建 client:断连重连后旧 client 的注册表缓存过期,只有整体重建才可靠。
+    // Always create a fresh client: after a disconnect/reconnect the old client's registry
+    // cache is stale, and only a full rebuild is reliable.
+    let client = IOHIDEventSystemClientCreate(std::ptr::null());
+    if client.is_null() {
+        log_info!("[device] failed to create IOHIDEventSystemClient");
+        return state;
     }
-    if rebuild_client {
-        // 蓝牙断连重连后旧 client 已失效:释放并置 null,强制重建。
-        // After a Bluetooth reconnect the old client is stale: release and null it so it's
-        // recreated below.
-        if !reg.client.is_null() {
-            CFRelease(reg.client as *const c_void);
-            reg.client = std::ptr::null_mut();
-        }
-    }
-    if reg.client.is_null() {
-        reg.client = IOHIDEventSystemClientCreate(std::ptr::null());
-        if reg.client.is_null() {
-            log_info!("[device] failed to create IOHIDEventSystemClient");
-            return;
-        }
-        // 匹配 Generic Desktop 页(后续按 usage 过滤)。
-        // Match the Generic Desktop page (filtered by usage below).
-        let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
-        let page_val: *mut AnyObject =
-            msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
-        let dict: *mut AnyObject =
-            msg_send![class!(NSDictionary), dictionaryWithObject: page_val, forKey: page_key];
-        let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
-        IOHIDEventSystemClientSetMatchingMultiple(reg.client, arr as *const c_void);
-        CFRelease(page_key as *const c_void);
-        // IOHIDEventSystemClient 的匹配是异步的:刚创建/重建后立刻 CopyServices 可能拿到
-        // 空列表(实测枚举结果在 0/1 间摇摆)。等 ~30ms 让匹配完成,枚举才可靠。
-        // 该竞态只在新建 client 的路径出现,复用旧 client 的热路径(事件归因)不受影响。
-        // Matching on IOHIDEventSystemClient is asynchronous: CopyServices right after
-        // creation/rebuild can return an empty list (measured 0/1 flapping). Waiting ~30ms
-        // lets matching settle; only the fresh-client path has this race, so the hot
-        // attribution path (reusing an old client) is unaffected.
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        // 调度到鼠标线程 runloop:未调度的 client 的 registry-ID 映射不完整,归因用的
-        // CopyServiceForRegistryID 会持续返回 nil(实测),滚动事件归因失败后回退到
-        // "所有鼠标"档 —— per-device 设置(如反转滚动)在启动后不生效,直到重新枚举
-        // 出可用的 client。调度后匹配常驻,归因可靠(LinearMouse 同款做法)。
-        // Schedule the client on the mouse thread's runloop: an unscheduled client's
-        // registry-ID map is incomplete and CopyServiceForRegistryID keeps returning nil
-        // (measured), so scroll attribution fails and falls back to the "All Mice" profile --
-        // per-device settings (e.g. reverse scrolling) don't apply after startup until a
-        // working client is re-enumerated. Scheduling keeps the matching live and makes
-        // attribution reliable (same approach as LinearMouse).
-        if let Some(rl) = *mouse_runloop_static().lock().unwrap() {
-            IOHIDEventSystemClientScheduleWithRunLoop(
-                reg.client,
-                rl,
-                crate::mouse::ffi::kCFRunLoopDefaultMode,
-            );
-        }
+    // 匹配 Generic Desktop 页(后续按 usage 过滤)。
+    // Match the Generic Desktop page (filtered by usage below).
+    let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
+    let page_val: *mut AnyObject =
+        msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
+    let dict: *mut AnyObject =
+        msg_send![class!(NSDictionary), dictionaryWithObject: page_val, forKey: page_key];
+    let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
+    IOHIDEventSystemClientSetMatchingMultiple(client, arr as *const c_void);
+    CFRelease(page_key as *const c_void);
+    // IOHIDEventSystemClient 的匹配是异步的:刚创建后立刻 CopyServices 可能拿到
+    // 空列表(实测枚举结果在 0/1 间摇摆)。等 ~30ms 让匹配完成,枚举才可靠。
+    // 该竞态只在新建 client 的路径出现;此 sleep 在 build_state 里,不持任何锁。
+    // Matching on IOHIDEventSystemClient is asynchronous: CopyServices right after
+    // creation can return an empty list (measured 0/1 flapping). Waiting ~30ms
+    // lets matching settle; only the fresh-client path has this race, and the sleep
+    // lives in build_state, holding no lock.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    // 调度到鼠标线程 runloop:未调度的 client 的 registry-ID 映射不完整,归因用的
+    // CopyServiceForRegistryID 会持续返回 nil(实测),滚动事件归因失败后回退到
+    // "所有鼠标"档 —— per-device 设置(如反转滚动)在启动后不生效,直到重新枚举
+    // 出可用的 client。调度后匹配常驻,归因可靠(LinearMouse 同款做法)。
+    // Schedule the client on the mouse thread's runloop: an unscheduled client's
+    // registry-ID map is incomplete and CopyServiceForRegistryID keeps returning nil
+    // (measured), so scroll attribution fails and falls back to the "All Mice" profile --
+    // per-device settings (e.g. reverse scrolling) don't apply after startup until a
+    // working client is re-enumerated. Scheduling keeps the matching live and makes
+    // attribution reliable (same approach as LinearMouse).
+    if let Some(rl) = *mouse_runloop_static().lock().unwrap() {
+        IOHIDEventSystemClientScheduleWithRunLoop(
+            client,
+            rl,
+            crate::mouse::ffi::kCFRunLoopDefaultMode,
+        );
     }
 
-    let services = IOHIDEventSystemClientCopyServices(reg.client);
+    let services = IOHIDEventSystemClientCopyServices(client);
     if services.is_null() {
+        // 拷贝失败:丢弃半成品(新 client 在这里释放),旧注册表保持可用。
+        // Copy failed: discard the half-built state (the fresh client is released here) and
+        // keep the old registry usable.
         log_info!("[device] no services returned");
-        reg.devices.clear();
-        return;
+        CFRelease(client as *const c_void);
+        return state;
     }
-    reg.services = services;
-
-    reg.devices.clear();
+    state.client = client;
+    state.services = services;
 
     let count = CFArrayGetCount(services);
     for i in 0..count {
@@ -270,22 +284,67 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
             },
             service_client: service,
         };
-        reg.devices.push(dev);
+        state.devices.push(dev);
     }
 
     log_debug!(
         "[device] enumerated {} pointer device(s).",
-        reg.devices.len()
+        state.devices.len()
     );
+    state
+}
+
+/// 短时持锁把新状态整体换入注册表,再释放被替换的旧 client/services。
+/// 交换期间归因路径拿不到锁,看到的要么是完整旧状态、要么是完整新状态;旧 devices
+/// 的 service 指针由旧 services 数组保活,随之一起释放,无悬垂。
+///
+/// Swap the new state into the registry under a brief lock, then release the replaced old
+/// client/services. Attribution can't take the lock mid-swap, so it sees either the complete
+/// old state or the complete new state. The old devices' service pointers are kept alive by the
+/// old services array, which is released together with them, so nothing dangles.
+unsafe fn swap_state(new: RegistryState) {
+    if new.client.is_null() {
+        // 构建失败:不交换,保留旧注册表。
+        // Build failed: keep the old registry instead of swapping.
+        return;
+    }
+    let mut reg = registry().lock().unwrap();
+    let old_client = reg.client;
+    let old_services = reg.services;
+    reg.client = new.client;
+    reg.services = new.services;
+    reg.devices = new.devices;
+    if !old_services.is_null() {
+        CFRelease(old_services as *const c_void);
+    }
+    if !old_client.is_null() {
+        CFRelease(old_client as *const c_void);
+    }
+}
+
+/// 锁外重建 + 短时交换:强制重建 IOHIDEventSystemClient 并重枚举。蓝牙断连重连、
+/// dock 掉线重连后旧 client 的缓存过期,只有整体重建才可靠。返回新枚举的设备数。
+///
+/// Rebuild outside the lock + brief swap: forcibly recreate the IOHIDEventSystemClient and
+/// re-enumerate. After a Bluetooth or dock disconnect/reconnect the old client's cache is
+/// stale, and only a full rebuild is reliable. Returns the freshly enumerated device count.
+unsafe fn rebuild_and_swap() -> usize {
+    let state = build_state();
+    let count = state.devices.len();
+    swap_state(state);
+    count
 }
 
 /// 启动时枚举一次(惰性:首次归因失败时也会触发)。
 /// Enumerate once at startup (also lazily triggered on first attribution failure).
 pub(crate) fn ensure_enumerated() {
-    let mut reg = registry().lock().unwrap();
-    if reg.client.is_null() || reg.devices.is_empty() {
-        unsafe { enumerate_locked(&mut reg, false) };
+    {
+        let reg = registry().lock().unwrap();
+        if !reg.client.is_null() && !reg.devices.is_empty() {
+            return;
+        }
     }
+    unsafe { rebuild_and_swap() };
 }
 
 /// 当前已连接设备列表的快照(VID/PID/名称)。无设置 UI 时仅作调试/日志与后续扩展用,
@@ -297,26 +356,26 @@ pub(crate) fn ensure_enumerated() {
 #[allow(dead_code)]
 pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
     {
-        let reg = registry().lock().unwrap();
-        if reg.client.is_null() || reg.devices.is_empty() {
-            drop(reg);
-            ensure_enumerated();
+        let empty = {
+            let reg = registry().lock().unwrap();
+            reg.client.is_null() || reg.devices.is_empty()
+        };
+        if empty {
+            unsafe { rebuild_and_swap() };
         }
     }
     {
-        let reg = registry().lock().unwrap();
-        if reg.devices.is_empty() {
+        let empty = registry().lock().unwrap().devices.is_empty();
+        if empty {
             // 枚举返回 0 但设备可能在场(陈旧 client / 异步匹配竞态):重建 client 重试,
-            // 重建路径自带 30ms settle(见 enumerate_locked)。重试仍为空才认作真无设备。
+            // 重建路径自带 30ms settle(在锁外的 build_state 里)。重试仍为空才认作真无设备。
             // Enumeration came back empty while devices may be present (stale client or the
-            // async-matching race): retry with a rebuilt client (which carries the 30ms settle
-            // in enumerate_locked). Only give up after the retries still return empty.
-            drop(reg);
+            // async-matching race): retry with a rebuilt client (whose 30ms settle lives in the
+            // lock-free build_state). Only give up after the retries still return empty.
             for _ in 0..2 {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                let mut reg = registry().lock().unwrap();
-                unsafe { enumerate_locked(&mut reg, true) };
-                if !reg.devices.is_empty() {
+                unsafe { rebuild_and_swap() };
+                if !registry().lock().unwrap().devices.is_empty() {
                     break;
                 }
             }
@@ -345,43 +404,93 @@ fn manager_static() -> &'static Mutex<*mut c_void> {
         .0
 }
 
-/// 插拔回调防抖:启动时 IOHIDManager 会对在场设备触发一连串 matching 回调,而每次处理
-/// (重建 client + 指针重应用)又会反向触发下一次回调,形成 6-7 连发的反馈循环 —— 既
-/// 刷日志噪音,又拉长启动繁忙窗口(macOS 对繁忙期未及时服务的 tap 会自动禁用,见
-/// event_tap.rs 的看门狗)。500ms 内只处理第一次,后续回调直接跳过,循环随之断开。
-/// 真实的重插拔周期远大于 500ms,不会误合并。
+/// 插拔信号:回调只置位,worker 线程消费。处理期间的信号不丢(合并为一次),醒来后
+/// 再处理一遍,保证最终状态收敛到最新设备列表。
+/// Plug signal: the callback only sets the flag; the worker thread consumes it. Signals
+/// arriving during handling are coalesced into one more pass after wakeup, so the registry
+/// always converges to the latest device list.
+struct PlugSignal {
+    pending: bool,
+}
+
+static PLUG_SIGNAL: Mutex<PlugSignal> = Mutex::new(PlugSignal { pending: false });
+static PLUG_CV: Condvar = Condvar::new();
+
+/// plug worker 只需启动一次(由 start_plug_monitor 惰性创建),线程与进程同寿命。
+/// The plug worker starts once (lazily from start_plug_monitor) and lives as long as the
+/// process.
+static PLUG_WORKER: OnceLock<()> = OnceLock::new();
+
+/// 插拔处理防抖:启动时 IOHIDManager 会对在场设备触发一连串 matching 回调,而每次
+/// 处理(重建 client + 指针重应用)又会反向触发下一次回调,形成 6-7 连发的反馈循环 —— 既
+/// 刷日志噪音,又拉长繁忙窗口(macOS 对繁忙期未及时服务的 tap 会自动禁用,见
+/// event_tap.rs 的看门狗)。500ms 内只处理第一次,后续信号直接跳过,循环随之断开。
+/// 真实的重插拔周期远大于 500ms,不会误合并。防抖检查在 worker 侧执行(回调只转发信号)。
 ///
-/// Plug-callback debounce: at startup IOHIDManager fires a burst of matching callbacks for
+/// Plug-handling debounce: at startup IOHIDManager fires a burst of matching callbacks for
 /// on-screen devices, and each handling (client rebuild + pointer re-apply) triggers the next
-/// callback -- a 6-7 round feedback loop that spams the log and lengthens the busy startup
-/// window (macOS auto-disables taps that don't service events during that window; see the
-/// watchdog in event_tap.rs). Only the first callback within 500ms is processed; the rest are
-/// skipped, breaking the loop. Real re-plug cycles are far longer than 500ms, so no legitimate
-/// event gets merged away.
+/// callback -- a 6-7 round feedback loop that spams the log and lengthens the busy window
+/// (macOS auto-disables taps that don't service events during that window; see the watchdog
+/// in event_tap.rs). Only the first signal within 500ms is handled; the rest are skipped,
+/// breaking the loop. Real re-plug cycles are far longer than 500ms, so no legitimate event
+/// gets merged away. The debounce check runs on the worker side (the callback only forwards
+/// a signal).
 static LAST_PLUG_HANDLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 const PLUG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// IOHIDManager 回调:设备接入/移除时,强制重建注册表(重建 IOHIDEventSystemClient)。
-/// 蓝牙鼠标休眠断连重连正是走这里——重连触发 removal+matching 回调,重建后归因链恢复,
-/// 不必等下一次归因失败才自愈。重建后还要重新应用指针加速设置:加速度属性写在旧的
-/// IOHIDServiceClient 实例上,断连后随实例消失,新实例恢复默认(加速度重新生效),必须
-/// 在重连时重新 apply,否则"禁用指针加速"失效,只能靠用户进设置手动点一次恢复。
+/// IOHIDManager 回调:设备接入/移除时只做信号转发,立即返回。重建 client(含 30ms
+/// settle)、重枚举、侧键释放与指针重应用全部移到 plug worker 线程;掉线风暴期间鼠标
+/// 线程的 event tap 不再被这些重活堵住(此前表现为滚动与侧键卡顿)。重建后要重新应用
+/// 指针加速设置:加速度属性写在旧的 IOHIDServiceClient 实例上,断连后随实例消失,
+/// 新实例恢复默认(加速度重新生效),必须在重连时重新 apply,否则"禁用指针加速"失效,
+/// 只能靠用户进设置手动点一次恢复(由 worker 侧的 pointer::apply 入队完成)。
 ///
-/// IOHIDManager callback: on device attach/detach, force-rebuild the registry (recreate the
-/// IOHIDEventSystemClient). A Bluetooth disconnect/reconnect fires these callbacks; the rebuild
-/// restores the attribution chain without waiting for the next failed attribution. Pointer
-/// acceleration must also be re-applied: the acceleration properties live on the old
-/// IOHIDServiceClient instance, which disappears on disconnect; the new instance reverts to
-/// defaults (acceleration back on). Without re-applying on reconnect, "disable pointer
-/// acceleration" silently breaks until the user re-toggles it in Settings.
+/// IOHIDManager callback: on device attach/detach, forward a signal and return immediately.
+/// The client rebuild (including the 30ms settle), re-enumeration, side-button release and
+/// pointer re-apply all move to the plug worker thread; during disconnect storms the mouse
+/// thread's event tap is no longer blocked by that work (which used to stall scrolling and
+/// side buttons). Pointer acceleration must be re-applied on reconnect: the acceleration
+/// properties live on the old IOHIDServiceClient instance, which disappears on disconnect;
+/// the new instance reverts to defaults (acceleration back on). Without re-applying,
+/// "disable pointer acceleration" silently breaks until the user re-toggles it in Settings
+/// (done by enqueueing pointer::apply on the worker side).
 unsafe extern "C" fn device_change_callback(
     _context: *mut c_void,
     _result: i32,
     _sender: *mut c_void,
     _callback: *mut c_void,
 ) {
-    // 防抖(见 LAST_PLUG_HANDLE 注释):500ms 内的重复插拔回调只处理第一次。
-    // Debounce (see LAST_PLUG_HANDLE): only the first plug callback within 500ms is handled.
+    let mut signal = PLUG_SIGNAL.lock().unwrap();
+    signal.pending = true;
+    PLUG_CV.notify_all();
+}
+
+/// 惰性启动 plug worker 线程(仅一次;在注册回调前调用,保证信号有消费者)。
+/// Lazily start the plug worker thread (once; called before the callbacks are registered so
+/// the signal always has a consumer).
+fn ensure_plug_worker() {
+    PLUG_WORKER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("device-plug".into())
+            .spawn(|| loop {
+                let mut signal = PLUG_SIGNAL.lock().unwrap();
+                while !signal.pending {
+                    signal = PLUG_CV.wait(signal).unwrap();
+                }
+                signal.pending = false;
+                drop(signal);
+                unsafe { handle_plug_event() };
+            })
+            .expect("failed to spawn device plug worker thread");
+    });
+}
+
+/// 处理一次插拔信号:防抖 -> 锁外重建并交换注册表 -> 释放侧键 -> 触发指针重应用。
+/// Handle one plug signal: debounce -> rebuild + swap the registry outside the lock ->
+/// release side buttons -> trigger the pointer re-apply.
+unsafe fn handle_plug_event() {
+    // 防抖(见 LAST_PLUG_HANDLE 注释):500ms 内的重复信号只处理第一次。
+    // Debounce (see LAST_PLUG_HANDLE): only the first signal within 500ms is handled.
     {
         let mut last = LAST_PLUG_HANDLE.lock().unwrap();
         if last.is_some_and(|t| t.elapsed() < PLUG_DEBOUNCE) {
@@ -389,55 +498,55 @@ unsafe extern "C" fn device_change_callback(
         }
         *last = Some(std::time::Instant::now());
     }
-    {
-        let mut reg = registry().lock().unwrap();
-        enumerate_locked(&mut reg, true);
-        log_debug!(
-            "[device] plug/unplug event: re-enumerated {} device(s).",
-            reg.devices.len()
-        );
-    }
+    let count = rebuild_and_swap();
+    log_debug!(
+        "[device] plug/unplug event: re-enumerated {} device(s).",
+        count
+    );
     // 断连/重连可能让用户松开侧键的事件丢失(设备移除时 up 事件收不到),
     // 释放所有按住的侧键目标键,避免 cmd/ctrl/opt/shift 卡住。
     // A disconnect/reconnect can lose the side-button up event (the device is gone before
     // the up arrives), so release every held target to keep modifiers like cmd/ctrl/opt/
     // shift from sticking.
     crate::mouse::buttons::release_all();
-    // 释放 REGISTRY 锁后再 apply(pointer::apply 自建 client、不锁 REGISTRY,但避免
-    // 持锁期间做重活)。apply 内部检查 mouse.enabled,未启用时自动跳过;幂等可重复调用。
-    // Drop the REGISTRY lock before applying (pointer::apply creates its own client and never
-    // locks REGISTRY, but avoid doing heavy work while holding the lock). apply checks
-    // mouse.enabled internally and skips when disabled; idempotent, safe to call repeatedly.
+    // apply 已异步化:这里只是入队,立即返回。apply 内部检查 mouse.enabled,未启用时
+    // 自动跳过;幂等可重复调用,待处理请求在 pointer 侧合并为一次。
+    // apply is async now: this only enqueues and returns immediately. apply checks
+    // mouse.enabled internally and skips when disabled; idempotent, safe to call repeatedly,
+    // and pending requests coalesce into one on the pointer side.
     crate::mouse::pointer::apply();
 }
 
 /// 启动设备插拔监听:创建 IOHIDManager,注册接入/移除回调,挂到指定 RunLoop。
-/// 由鼠标线程调用(传该线程的 CFRunLoop),回调即在那个线程执行,与 event tap 同线程,
-/// 对 REGISTRY 加锁安全。matching 与枚举一致:Generic Desktop 页的指针/鼠标/触控板。
+/// 由鼠标线程调用(传该线程的 CFRunLoop),回调即在那个线程执行。matching 与枚举
+/// 一致:Generic Desktop 页的指针/鼠标/触控板。
 ///
 /// Start device plug/unplug monitoring: create an IOHIDManager, register attach/detach callbacks,
-/// and schedule it on the given RunLoop (the mouse thread's). Callbacks then run on that thread,
-/// same as the event tap, so locking REGISTRY is safe. Matching mirrors enumeration: pointer/mouse/
-/// trackpad on the Generic Desktop page.
+/// and schedule it on the given RunLoop (the mouse thread's), so callbacks run on that thread.
+/// Matching mirrors enumeration: pointer/mouse/trackpad on the Generic Desktop page.
 pub(crate) unsafe fn start_plug_monitor(runloop: crate::mouse::ffi::CFRunLoopRef) {
     let m = manager_static();
     let mut m = m.lock().unwrap();
     if !m.is_null() {
         return;
     }
-    // 记录鼠标线程 runloop,供 enumerate_locked 调度注册表 client(归因可靠性)。
-    // Record the mouse thread's runloop for enumerate_locked to schedule the registry client
+    // 记录鼠标线程 runloop,供 build_state 调度注册表 client(归因可靠性)。
+    // Record the mouse thread's runloop for build_state to schedule the registry client
     // (attribution reliability).
     *mouse_runloop_static().lock().unwrap() = Some(runloop);
+    // 先启动 plug worker(惰性,仅一次),再注册回调,信号必有消费者。
+    // Start the plug worker first (lazily, once), then register callbacks, so every signal
+    // has a consumer.
+    ensure_plug_worker();
     let manager_obj = IOHIDManagerCreate(std::ptr::null(), 0);
     if manager_obj.is_null() {
         log_info!("[device] failed to create IOHIDManager");
         return;
     }
     // matching:PrimaryUsagePage=Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad}。
-    // 与 enumerate_locked 的过滤一致。
+    // 与 build_state 的过滤一致。
     // Matching: PrimaryUsagePage = Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad},
-    // mirroring enumerate_locked's filter.
+    // mirroring build_state's filter.
     let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
     let page_val: *mut AnyObject =
         msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
@@ -525,17 +634,19 @@ pub(crate) fn device_from_cgevent(cg_event: crate::mouse::ffi::CGEventRef) -> Op
                 return Some(dev.key());
             }
         }
-        // 未命中:可能新设备插入或蓝牙断连重连后注册表过期。强制重建 client + 重枚举后重查。
-        // 只重枚举不重建 client 是不够的:蓝牙重连后旧 client 的缓存已失效,重枚举拿到的
-        // 仍是过期列表,归因会持续失败(表现为每次事件都重枚举仍不命中)。
-        // Miss: a newly-plugged device or a Bluetooth reconnect may have made the registry stale.
-        // Force-rebuild the client + re-enumerate, then retry. Re-enumerating with the old client
-        // is not enough: after a Bluetooth reconnect the old client's cache is dead, so the
-        // re-enumeration still yields a stale list and attribution keeps failing (observable as a
-        // re-enumeration on every event that still misses).
+        // 未命中:可能新设备插入或断连重连后注册表过期。锁外重建 client + 重枚举,再短时
+        // 持锁交换后重查;绝不持锁 sleep。只重枚举不重建 client 是不够的:重连后旧 client
+        // 的缓存已失效,重枚举拿到的仍是过期列表,归因会持续失败(表现为每次事件都重枚举
+        // 仍不命中)。
+        // Miss: a newly-plugged device or a reconnect may have made the registry stale.
+        // Rebuild the client + re-enumerate outside the lock, swap under a brief lock, then
+        // retry; never sleep while holding the lock. Re-enumerating with the old client is not
+        // enough: after a reconnect the old client's cache is dead, so the re-enumeration still
+        // yields a stale list and attribution keeps failing (observable as a re-enumeration on
+        // every event that still misses).
         {
-            let mut reg = registry().lock().unwrap();
-            enumerate_locked(&mut reg, true);
+            rebuild_and_swap();
+            let reg = registry().lock().unwrap();
             if let Some(idx) = lookup_service_index(&reg, sender) {
                 let dev = &reg.devices[idx];
                 *LAST_ACTIVE_KEY.lock().unwrap() = Some(dev.key());
