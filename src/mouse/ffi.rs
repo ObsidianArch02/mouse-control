@@ -543,10 +543,10 @@ pub(crate) const K_CG_HID_EVENT_TAP: i32 = 0;
 /// CGEventCreateScrollWheelEvent2 units: kCGScrollEventUnitLine=1 (line-level, discrete scroll).
 pub(crate) const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 
-/// kCGScrollEventUnitPixel=2(像素级,离散滚动;line_height 模式用)。
-/// kCGScrollEventUnitPixel=2 (pixel-level, discrete scroll; used by the line_height mode).
+/// kCGScrollEventUnitPixel=0(像素级,离散滚动;line_height 模式用)。
+/// kCGScrollEventUnitPixel=0 (pixel-level, discrete scroll; used by the line_height mode).
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 2;
+pub(crate) const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
 
 /// eventSourceUserData 字段(field 42)。用于在合成事件上打标记,防止自己的 tap 无限循环。
 /// eventSourceUserData field (field 42). Used to tag synthetic events so our own tap can
