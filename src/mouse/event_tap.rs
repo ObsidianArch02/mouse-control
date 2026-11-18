@@ -16,15 +16,16 @@ use crate::ffi::CFRelease;
 use crate::mouse::buttons;
 use crate::mouse::device;
 use crate::mouse::ffi::{
-    self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent, CGEventCreate,
-    CGEventCreateScrollWheelEvent2, CGEventFlags, CGEventGetFlags, CGEventGetIntegerValueField,
-    CGEventGetLocation, CGEventMask, CGEventPost, CGEventRef, CGEventSetFlags,
-    CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, K_CG_EVENT_SOURCE_USER_DATA,
-    K_CG_EVENT_TYPE, K_CG_SCROLL_EVENT_UNIT_LINE, K_CG_SCROLL_EVENT_UNIT_PIXEL,
-    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
-    K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
-    K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
-    K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, K_CG_SESSION_EVENT_TAP, SYNTHETIC_MARKER,
+    self, is_synthetic_scroll_marker, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent,
+    CGEventCreate, CGEventCreateScrollWheelEvent2, CGEventFlags, CGEventGetFlags,
+    CGEventGetIntegerValueField, CGEventGetLocation, CGEventMask, CGEventPost, CGEventRef,
+    CGEventSetFlags, CGEventSetIntegerValueField, CGEventSetLocation, CGEventTapProxy, CGEventType,
+    CGPointFFI, K_CG_EVENT_SOURCE_USER_DATA, K_CG_EVENT_TYPE, K_CG_SCROLL_EVENT_UNIT_LINE,
+    K_CG_SCROLL_EVENT_UNIT_PIXEL, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
+    K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
+    K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+    K_CG_SESSION_EVENT_TAP, MOS_SYNTHETIC_MARKER,
 };
 use crate::mouse::resolve;
 use crate::mouse::scrolling::{compute_continuous_delta, compute_delta, ScrollMode, ScrollUnit};
@@ -54,7 +55,16 @@ const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
 /// Synthesize a scroll event and post it to the session level.
 /// The unit comes from ScrollUnit: lines (absent line_height / default mode) or pixels
 /// (the line_height mode); Default mode passes the raw delta through.
-unsafe fn post_scroll_event(dy: i32, dx: i32, units: ScrollUnit, flags: CGEventFlags) {
+unsafe fn post_scroll_event(
+    dy: i32,
+    dx: i32,
+    units: ScrollUnit,
+    flags: CGEventFlags,
+    loc: CGPointFFI,
+) {
+    if dy == 0 && dx == 0 {
+        return;
+    }
     let unit = match units {
         ScrollUnit::Line => K_CG_SCROLL_EVENT_UNIT_LINE,
         ScrollUnit::Pixel => K_CG_SCROLL_EVENT_UNIT_PIXEL,
@@ -66,8 +76,9 @@ unsafe fn post_scroll_event(dy: i32, dx: i32, units: ScrollUnit, flags: CGEventF
         return;
     }
 
+    CGEventSetLocation(synthetic, loc);
     CGEventSetFlags(synthetic, flags);
-    CGEventSetIntegerValueField(synthetic, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
+    CGEventSetIntegerValueField(synthetic, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
 
     CGEventPost(K_CG_SESSION_EVENT_TAP, synthetic);
     CFRelease(synthetic as *const c_void);
@@ -95,7 +106,15 @@ fn line_delta_from_point(point: i64) -> i64 {
 /// Synthesize a continuous (trackpad-style) scroll event and post it to the session level.
 /// Matches Mac Mouse Fix's ContinuousScroll output: explicitly set type=22, continuous=1,
 /// and write line / point / fixed-point deltas together.
-unsafe fn post_continuous_scroll_event(point_dy: i64, point_dx: i64, flags: CGEventFlags) {
+unsafe fn post_continuous_scroll_event(
+    point_dy: i64,
+    point_dx: i64,
+    flags: CGEventFlags,
+    loc: CGPointFFI,
+) {
+    if point_dy == 0 && point_dx == 0 {
+        return;
+    }
     let synthetic = CGEventCreate(std::ptr::null());
     if synthetic.is_null() {
         log_info!("[mouse] failed to synthesize continuous scroll event");
@@ -132,8 +151,9 @@ unsafe fn post_continuous_scroll_event(point_dy: i64, point_dx: i64, flags: CGEv
         line_dx * 65_536,
     );
 
+    CGEventSetLocation(synthetic, loc);
     CGEventSetFlags(synthetic, flags);
-    CGEventSetIntegerValueField(synthetic, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
+    CGEventSetIntegerValueField(synthetic, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
 
     CGEventPost(K_CG_SESSION_EVENT_TAP, synthetic);
     CFRelease(synthetic as *const c_void);
@@ -249,10 +269,10 @@ unsafe extern "C" fn mouse_event_tap_callback(
     let flags: CGEventFlags = CGEventGetFlags(event);
 
     if event_type == K_CG_EVENT_SCROLL_WHEEL {
-        // 跳过自己合成的滚轮事件(防御性,post 到 session 层的事件理论上不经过 HID tap)。
-        // Skip our own synthetic scroll events (defensive; session-posted events shouldn't reach HID tap).
+        // 跳过自己或协调器标记的合成滚轮事件,避免 HID tap 重复拦截或回环。
+        // Skip synthetic scroll events carrying our marker or the Mos compatibility marker.
         let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
-        if user_data == SYNTHETIC_MARKER {
+        if is_synthetic_scroll_marker(user_data) {
             return event;
         }
 
@@ -323,10 +343,10 @@ unsafe extern "C" fn mouse_event_tap_callback(
         // event. Either way the original event is dropped.
         if resolved.scroll_mode == ScrollMode::Continuous {
             let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, &resolved);
-            post_continuous_scroll_event(ndy, ndx, flags);
+            post_continuous_scroll_event(ndy, ndx, flags, loc);
         } else {
             let (ndy, ndx, unit) = compute_delta(dy, dx, &resolved);
-            post_scroll_event(ndy, ndx, unit, flags);
+            post_scroll_event(ndy, ndx, unit, flags, loc);
         }
         std::ptr::null_mut()
     } else if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN || event_type == K_CG_EVENT_OTHER_MOUSE_UP {

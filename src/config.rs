@@ -343,6 +343,35 @@ fn config_path() -> std::path::PathBuf {
     dir.join("config.toml")
 }
 
+/// 解析 TOML 文本并按字段做容错校验。返回 `(有效配置, 校验错误列表, 是否需要回写净化结果)`；
+/// TOML 语法错误返回 Err,由调用方决定保留原文件不被默认值覆盖。
+///
+/// Parse TOML content and validate fields resiliently. Returns
+/// `(effective_config, validation_errors, needs_sanitized_save)`; syntax errors return `Err`
+/// so callers preserve the user's file instead of overwriting it with defaults.
+fn parse_and_sanitize_toml(content: &str) -> Result<(Config, Vec<String>, bool), String> {
+    let loaded: Config = toml::from_str(content).map_err(|e| e.to_string())?;
+    let errs = loaded.validate();
+    if errs.is_empty() {
+        Ok((loaded, Vec::new(), false))
+    } else {
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errs);
+        Ok((merged, errs, true))
+    }
+}
+
+fn apply_runtime_settings(cfg: &Config) {
+    // locale 可能随 reload 改变,重新应用 / locale may change on reload, re-apply
+    i18n::apply_config_locale(&cfg.i18n.locale);
+    // 热更新日志级别 / hot-reload log level
+    let lvl = match cfg.logging.level.as_str() {
+        "debug" => crate::logger::LogLevel::Debug,
+        _ => crate::logger::LogLevel::Info,
+    };
+    crate::logger::reconfigure(lvl);
+}
+
 impl Config {
     /// 把当前配置序列化为 TOML 写回 `~/.config/mouse-control/config.toml`。
     /// Serialize this config to TOML and write it back to the config file.
@@ -357,19 +386,15 @@ impl Config {
     pub fn load_or_default() -> (Self, Vec<String>) {
         let path = config_path();
         match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let loaded: Config = toml::from_str(&content).unwrap_or_default();
-                let errs = loaded.validate();
-                if !errs.is_empty() {
-                    // Start from defaults, merge only valid fields
-                    let mut merged = Config::default();
-                    merged.merge_valid(loaded, &errs);
-                    let _ = merged.save();
-                    (merged, errs)
-                } else {
-                    (loaded, Vec::new())
+            Ok(content) => match parse_and_sanitize_toml(&content) {
+                Ok((cfg, errs, needs_save)) => {
+                    if needs_save {
+                        let _ = cfg.save();
+                    }
+                    (cfg, errs)
                 }
-            }
+                Err(parse_err) => (Config::default(), vec![format!("parse config: {parse_err}")]),
+            },
             Err(_) => {
                 // File doesn't exist — write defaults
                 let defaults = Config::default();
@@ -384,18 +409,15 @@ impl Config {
     pub fn reload() -> (Self, Vec<String>) {
         let path = config_path();
         match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                let loaded: Config = toml::from_str(&content).unwrap_or_default();
-                let errs = loaded.validate();
-                if !errs.is_empty() {
-                    let mut merged = Config::default();
-                    merged.merge_valid(loaded, &errs);
-                    let _ = merged.save();
-                    (merged, errs)
-                } else {
-                    (loaded, Vec::new())
+            Ok(content) => match parse_and_sanitize_toml(&content) {
+                Ok((cfg, errs, needs_save)) => {
+                    if needs_save {
+                        let _ = cfg.save();
+                    }
+                    (cfg, errs)
                 }
-            }
+                Err(parse_err) => (Config::default(), vec![format!("parse config: {parse_err}")]),
+            },
             Err(e) => {
                 let defaults = Config::default();
                 (
@@ -425,20 +447,47 @@ pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::ne
 /// Reload config from disk and apply. Returns validation errors (empty = success).
 pub fn reload_config() -> Vec<String> {
     let (new_cfg, errs) = Config::reload();
-    let locale = new_cfg.i18n.locale.clone();
-    let log_level = new_cfg.logging.level.clone();
+    apply_runtime_settings(&new_cfg);
     if let Ok(mut cfg) = CONFIG.write() {
         *cfg = new_cfg;
     }
-    // locale 可能随 reload 改变,重新应用 / locale may change on reload, re-apply
-    i18n::apply_config_locale(&locale);
-    // 热更新日志级别 / hot-reload log level
-    let lvl = match log_level.as_str() {
-        "debug" => crate::logger::LogLevel::Debug,
-        _ => crate::logger::LogLevel::Info,
-    };
-    crate::logger::reconfigure(lvl);
     errs
+}
+
+/// 切换 mouse.enabled 并持久化:写盘前先读取磁盘有效配置并合并 enabled,避免菜单开关
+/// 覆写用户在磁盘上刚编辑过的 profile。若磁盘 TOML 语法损坏,仅在内存更新 enabled,不覆盖磁盘。
+///
+/// Toggle mouse.enabled and persist it cleanly: reload valid profiles from disk before
+/// writing `enabled` so menu toggles never overwrite hand-edited disk profiles. If the
+/// disk TOML is malformed, update memory only and leave the file untouched.
+pub fn set_enabled_and_persist(enabled: bool) -> Vec<String> {
+    let path = config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(content) => match parse_and_sanitize_toml(&content) {
+            Ok((mut new_cfg, errs, _)) => {
+                new_cfg.mouse.enabled = enabled;
+                apply_runtime_settings(&new_cfg);
+                if let Ok(mut cfg) = CONFIG.write() {
+                    *cfg = new_cfg.clone();
+                }
+                let _ = new_cfg.save();
+                errs
+            }
+            Err(parse_err) => {
+                if let Ok(mut cfg) = CONFIG.write() {
+                    cfg.mouse.enabled = enabled;
+                }
+                vec![format!("parse config: {parse_err}")]
+            }
+        },
+        Err(_) => {
+            if let Ok(mut cfg) = CONFIG.write() {
+                cfg.mouse.enabled = enabled;
+                let _ = cfg.save();
+            }
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -704,5 +753,65 @@ line_height = 101
         let map = p.button_map.as_ref().unwrap();
         assert_eq!(map.get("3").map(String::as_str), Some("ctrl+left"));
         assert_eq!(map.get("4").map(String::as_str), Some("ctrl+right"));
+    }
+
+    #[test]
+    fn parse_and_sanitize_rejects_malformed_toml_without_silent_default() {
+        let broken = "[mouse]\nenabled = true\n[[mouse.profiles\nline_count = ???\n";
+        assert!(parse_and_sanitize_toml(broken).is_err());
+    }
+
+    #[test]
+    fn parse_and_sanitize_preserves_per_app_line_count_profiles() {
+        let raw = r#"
+[logging]
+level = "debug"
+file_path = ""
+
+[i18n]
+locale = "auto"
+
+[mouse]
+enabled = true
+
+[[mouse.profiles]]
+reverse_scroll = true
+scroll_mode = "line"
+line_count = 3
+
+[mouse.profiles.pointer]
+disable_acceleration = true
+
+[mouse.profiles.button_map]
+3 = "ctrl+right"
+4 = "ctrl+left"
+
+[[mouse.profiles]]
+app_bundle_id = "com.apple.ScreenContinuity"
+scroll_mode = "continuous"
+
+[[mouse.profiles]]
+app_bundle_id = "net.kovidgoyal.kitty"
+scroll_mode = "line"
+line_count = 1
+
+[[mouse.profiles]]
+app_bundle_id = "com.mitchellh.ghostty"
+scroll_mode = "line"
+line_count = 1
+
+[[mouse.profiles]]
+app_bundle_id = "com.apple.Notes"
+line_count = 2
+line_height = 24
+"#;
+        let (cfg, errs, needs_save) = parse_and_sanitize_toml(raw).unwrap();
+        assert!(errs.is_empty());
+        assert!(!needs_save);
+        assert_eq!(cfg.mouse.profiles.len(), 5);
+        assert_eq!(cfg.mouse.profiles[2].line_count, Some(1));
+        assert_eq!(cfg.mouse.profiles[3].line_count, Some(1));
+        assert_eq!(cfg.mouse.profiles[4].line_count, Some(2));
+        assert_eq!(cfg.mouse.profiles[4].line_height, Some(24));
     }
 }

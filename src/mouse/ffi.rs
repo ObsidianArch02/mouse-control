@@ -122,6 +122,9 @@ extern "C" {
     // y down; the same space as kCGWindowBounds). Used for window-under-cursor app
     // attribution of scroll events.
     pub(crate) fn CGEventGetLocation(event: CGEventRef) -> CGPointFFI;
+    // 写入合成事件的光标坐标,保证基于坐标分发的宿主应用能正确路由滚轮事件。
+    // Set the cursor location on synthetic events so coordinate-routed apps dispatch accurately.
+    pub(crate) fn CGEventSetLocation(event: CGEventRef, location: CGPointFFI);
 
     // 合成全新的滚轮事件。source 传 null 表示用默认 source;wheelCount 通常为 2
     // (wheel1=垂直,wheel2=水平)。
@@ -185,11 +188,15 @@ pub(crate) const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFF_FFF
 
 /// CGWindowListCopyWindowInfo 选项:只取屏幕上的窗口。
 /// CGWindowListCopyWindowInfo option: on-screen windows only.
-#[cfg_attr(test, allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
+/// CGWindowListCopyWindowInfo 选项:仅返回 relativeToWindow 指定的单个窗口。
+/// CGWindowListCopyWindowInfo option: include only the single window specified by relativeToWindow.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
 /// CGWindowListCopyWindowInfo 选项:排除桌面元素(桌面图标窗口)。
 /// CGWindowListCopyWindowInfo option: exclude desktop elements (desktop icon windows).
-#[cfg_attr(test, allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
 
 #[cfg_attr(test, allow(dead_code))]
@@ -214,7 +221,7 @@ pub(crate) struct CGPointFFI {
 /// CGSize passed by value (f64 width/height).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(test, allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) struct CGSizeFFI {
     pub width: f64,
     pub height: f64,
@@ -224,7 +231,7 @@ pub(crate) struct CGSizeFFI {
 /// CGRect passed by value (origin + size).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(test, allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) struct CGRectFFI {
     pub origin: CGPointFFI,
     pub size: CGSizeFFI,
@@ -236,11 +243,22 @@ extern "C" {
     // 参数 2(relativeToWindow)在不指定参照窗口时传 0。
     // On-screen window list as a CFArrayRef of CFDictionarys (+1 owned; caller CFReleases).
     // Pass 0 for relativeToWindow when no reference window is needed.
-    pub(crate) fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32)
-    -> *const c_void;
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn CGWindowListCopyWindowInfo(
+        option: u32,
+        relative_to_window: u32,
+    ) -> *const c_void;
+
+    // 读主显示器的全局坐标区域,用于把 CGEvent 左上角原点坐标换算为 AppKit 左下角坐标。
+    // Read the main display bounds to convert top-left CGEvent points into bottom-left AppKit coordinates.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn CGMainDisplayID() -> u32;
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn CGDisplayBounds(display: u32) -> CGRectFFI;
 
     // 从 kCGWindowBounds 字典还原 CGRect(失败返回 false)。
     // Restore a CGRect from a kCGWindowBounds dictionary (false on failure).
+    #[allow(dead_code)]
     pub(crate) fn CGRectMakeWithDictionaryRepresentation(
         dict: *const c_void,
         rect: *mut CGRectFFI,
@@ -251,6 +269,7 @@ extern "C" {
 extern "C" {
     // CF 字典按键取值(借用,不持有)。
     // Borrowed value lookup in a CF dictionary (not owned).
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CFDictionaryGetValue(
         the_dict: *const c_void,
         key: *const c_void,
@@ -258,6 +277,7 @@ extern "C" {
 
     // 读 CFNumber(成功返回 true 并写入 value)。
     // Read a CFNumber (returns true and writes value on success).
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CFNumberGetValue(
         number: *const c_void,
         the_type: isize,
@@ -267,8 +287,11 @@ extern "C" {
     // 窗口字典键:属主 PID、frame(kCGWindowBounds 是嵌套字典)、窗口层。
     // Window dictionary keys: owner PID, frame (kCGWindowBounds is a nested dictionary),
     // window layer.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) static kCGWindowOwnerPID: CFStringRef;
+    #[allow(dead_code)]
     pub(crate) static kCGWindowBounds: CFStringRef;
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) static kCGWindowLayer: CFStringRef;
 }
 
@@ -601,8 +624,21 @@ pub(crate) const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
 /// 合成事件标记魔数(ASCII "OMTSCRL")。写入 eventSourceUserData,我们的 tap 据此跳过。
 /// Synthetic-event marker magic (ASCII "OMTSCRL"). Written to eventSourceUserData so our tap
 /// can recognize and skip our own synthetic events.
-#[allow(clippy::unusual_byte_groupings)]
+#[allow(dead_code, clippy::unusual_byte_groupings)]
 pub(crate) const SYNTHETIC_MARKER: i64 = 0x4F4D_5453_4352_4C;
+
+/// Mos.app 滚轮 tap 的放行标记(ASCII "MOSSMOOT")。写入后合成滚轮事件在下游
+/// kCGAnnotatedSessionEventTap 会被 Mos 直接放行,避免二次平滑或二次反转。
+/// Pass-through marker checked by Mos.app's scroll tap (ASCII "MOSSMOOT"). Writing this
+/// value makes Mos skip our synthetic scroll events at kCGAnnotatedSessionEventTap without
+/// double smoothing or reversal.
+#[allow(clippy::unusual_byte_groupings)]
+pub(crate) const MOS_SYNTHETIC_MARKER: i64 = 0x4D4F_5353_4D4F_4F54;
+
+#[inline]
+pub(crate) fn is_synthetic_scroll_marker(user_data: i64) -> bool {
+    user_data == SYNTHETIC_MARKER || user_data == MOS_SYNTHETIC_MARKER
+}
 
 // ========== 属性键常量 / property key constants ==========
 
@@ -797,6 +833,19 @@ extern "C" {
     #[cfg_attr(test, allow(dead_code))]
     #[link_name = "objc_msgSend"]
     pub(crate) fn objc_msgSend_release(receiver: *mut AnyObject, selector: Sel);
+
+    /// objc_msgSend 裸调用:调用 +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:]
+    /// 让 WindowServer 执行真实命中测试(自动跳过 ignoresMouseEvents 透明穿透覆盖层)。
+    /// Raw objc_msgSend: call +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:] so
+    /// WindowServer performs true hit-testing and skips ignoresMouseEvents click-through overlays.
+    #[cfg_attr(test, allow(dead_code))]
+    #[link_name = "objc_msgSend"]
+    pub(crate) fn objc_msgSend_window_number_at_point(
+        receiver: *mut AnyObject,
+        selector: Sel,
+        point: NSPointFFI,
+        window_number: isize,
+    ) -> isize;
 }
 
 // HID 用途常量 / HID usage constants

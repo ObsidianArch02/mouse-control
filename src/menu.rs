@@ -11,7 +11,7 @@ use objc2::{class, msg_send};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
-use crate::config::{reload_config, CONFIG};
+use crate::config::{reload_config, set_enabled_and_persist, CONFIG};
 use crate::ffi::*;
 use crate::i18n::t;
 use crate::log_info;
@@ -78,12 +78,15 @@ pub(crate) extern "C" fn handle_mouse_enable_toggle(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    let enable = {
-        let mut cfg = CONFIG.write().unwrap();
-        cfg.mouse.enabled = !cfg.mouse.enabled;
-        let _ = cfg.save();
-        cfg.mouse.enabled
-    };
+    let enable = !CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
+    let errs = set_enabled_and_persist(enable);
+    if !errs.is_empty() {
+        log_info!("Config sync during toggle: {} error(s):", errs.len());
+        for e in &errs {
+            log_info!("  • {}", e);
+        }
+    }
+    resolve::invalidate_cache();
     if enable {
         // 启用时若缺辅助功能权限,显式弹系统授权框提醒用户;重装后的旧授权条目需先删除。
         // When enabling without Accessibility, explicitly raise the system prompt to remind the
@@ -100,6 +103,7 @@ pub(crate) extern "C" fn handle_mouse_enable_toggle(
         mouse::pointer::apply();
         log_info!("Mouse control enabled via menu.");
     } else {
+        buttons::release_all();
         mouse::stop();
         mouse::pointer::restore();
         log_info!("Mouse control disabled via menu.");
