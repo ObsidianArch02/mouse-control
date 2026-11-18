@@ -39,8 +39,7 @@ menu-bar icon, because the agent runs inside the user's GUI session.
 
 ## Requirements
 
-- macOS 26+ runtime (arm64; CI cross-builds with the osxcross SDK 13.3 toolchain, deployment
-  target 11.0, so the binary also runs on older macOS).
+- macOS on Apple Silicon (`aarch64-apple-darwin`).
 - **Accessibility** permission for the app. The HID-level event tap needs it to modify/drop
   events. Without it the app logs a retry notice and keeps running; grant it under
   System Settings → Privacy & Security → Accessibility.
