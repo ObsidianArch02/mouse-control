@@ -30,8 +30,10 @@ use crate::mouse::ffi::*;
 use crate::{log_debug, log_info};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 // ========== 设备身份与运行时表示 / device identity & runtime handle ==========
 
@@ -87,6 +89,9 @@ struct DeviceRegistry {
     /// Holds the services CFArray (keeping its IOHIDServiceClients alive).
     services: *mut c_void,
     devices: Vec<Device>,
+    by_registry_id: HashMap<u64, DeviceKey>,
+    missed_senders: HashSet<u64>,
+    scheduled_rl: Option<crate::mouse::ffi::CFRunLoopRef>,
 }
 
 unsafe impl Send for DeviceRegistry {}
@@ -129,6 +134,9 @@ fn registry() -> &'static Mutex<DeviceRegistry> {
             client: std::ptr::null_mut(),
             services: std::ptr::null_mut(),
             devices: Vec::new(),
+            by_registry_id: HashMap::new(),
+            missed_senders: HashSet::new(),
+            scheduled_rl: None,
         })
     })
 }
@@ -173,6 +181,8 @@ struct RegistryState {
     client: *mut c_void,
     services: *mut c_void,
     devices: Vec<Device>,
+    by_registry_id: HashMap<u64, DeviceKey>,
+    scheduled_rl: Option<crate::mouse::ffi::CFRunLoopRef>,
 }
 
 /// 构建一份全新的注册表状态:新建 IOHIDEventSystemClient、等匹配 settle、调度到鼠标
@@ -187,111 +197,128 @@ struct RegistryState {
 /// client and the old registry is left untouched (the old state keeps serving attribution
 /// during the rebuild; the old client/services are only released after the swap).
 unsafe fn build_state() -> RegistryState {
-    let mut state = RegistryState {
-        client: std::ptr::null_mut(),
-        services: std::ptr::null_mut(),
-        devices: Vec::new(),
-    };
-    // 一律新建 client:断连重连后旧 client 的注册表缓存过期,只有整体重建才可靠。
-    // Always create a fresh client: after a disconnect/reconnect the old client's registry
-    // cache is stale, and only a full rebuild is reliable.
-    let client = IOHIDEventSystemClientCreate(std::ptr::null());
-    if client.is_null() {
-        log_info!("[device] failed to create IOHIDEventSystemClient");
-        return state;
-    }
-    // 匹配 Generic Desktop 页(后续按 usage 过滤)。
-    // Match the Generic Desktop page (filtered by usage below).
-    let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
-    let page_val: *mut AnyObject =
-        msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
-    let dict: *mut AnyObject =
-        msg_send![class!(NSDictionary), dictionaryWithObject: page_val, forKey: page_key];
-    let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
-    IOHIDEventSystemClientSetMatchingMultiple(client, arr as *const c_void);
-    CFRelease(page_key as *const c_void);
-    // IOHIDEventSystemClient 的匹配是异步的:刚创建后立刻 CopyServices 可能拿到
-    // 空列表(实测枚举结果在 0/1 间摇摆)。等 ~30ms 让匹配完成,枚举才可靠。
-    // 该竞态只在新建 client 的路径出现;此 sleep 在 build_state 里,不持任何锁。
-    // Matching on IOHIDEventSystemClient is asynchronous: CopyServices right after
-    // creation can return an empty list (measured 0/1 flapping). Waiting ~30ms
-    // lets matching settle; only the fresh-client path has this race, and the sleep
-    // lives in build_state, holding no lock.
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    // 调度到鼠标线程 runloop:未调度的 client 的 registry-ID 映射不完整,归因用的
-    // CopyServiceForRegistryID 会持续返回 nil(实测),滚动事件归因失败后回退到
-    // "所有鼠标"档 —— per-device 设置(如反转滚动)在启动后不生效,直到重新枚举
-    // 出可用的 client。调度后匹配常驻,归因可靠(LinearMouse 同款做法)。
-    // Schedule the client on the mouse thread's runloop: an unscheduled client's
-    // registry-ID map is incomplete and CopyServiceForRegistryID keeps returning nil
-    // (measured), so scroll attribution fails and falls back to the "All Mice" profile --
-    // per-device settings (e.g. reverse scrolling) don't apply after startup until a
-    // working client is re-enumerated. Scheduling keeps the matching live and makes
-    // attribution reliable (same approach as LinearMouse).
-    if let Some(rl) = *mouse_runloop_static().lock().unwrap() {
-        IOHIDEventSystemClientScheduleWithRunLoop(
-            client,
-            rl,
-            crate::mouse::ffi::kCFRunLoopDefaultMode,
-        );
-    }
-
-    let services = IOHIDEventSystemClientCopyServices(client);
-    if services.is_null() {
-        // 拷贝失败:丢弃半成品(新 client 在这里释放),旧注册表保持可用。
-        // Copy failed: discard the half-built state (the fresh client is released here) and
-        // keep the old registry usable.
-        log_info!("[device] no services returned");
-        CFRelease(client as *const c_void);
-        return state;
-    }
-    state.client = client;
-    state.services = services;
-
-    let count = CFArrayGetCount(services);
-    for i in 0..count {
-        let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
-        // 用 ConformsTo 判断是否指针/鼠标/触控板,不读 PrimaryUsage 单值。
-        // 原因:有些真实鼠标(如 ATK A9 SE 这类 Nearlink/星闪设备)的 PrimaryUsage 被
-        // 系统报成 Keyboard(6),白名单 {1,2,5} 会把它剔除;ConformsTo 检查整个
-        // DeviceUsagePairs,能识别它声明过的 Mouse(1,2)/Pointer(1,1)/Trackpad(1,5)。
-        // 副作用:少数键盘也声明了多余的 Mouse 用途(与 LinearMouse 行为一致),会一并
-        // 纳入;归因靠 senderID 精确匹配,不影响功能正确性。
-        //
-        // Determine pointer/mouse/trackpad via ConformsTo instead of the PrimaryUsage scalar.
-        // Some real mice (e.g. ATK A9 SE Nearlink devices) report PrimaryUsage = Keyboard(6),
-        // and a {1,2,5} whitelist would drop them; ConformsTo inspects the full DeviceUsagePairs
-        // and sees the Mouse(1,2)/Pointer(1,1)/Trackpad(1,5) usages they declare. Side effect:
-        // a few keyboards also declare extra Mouse usages (same as LinearMouse) and get included;
-        // attribution uses exact senderID matching, so this never affects correctness.
-        let is_pointer = IOHIDServiceClientConformsTo(service, 1, USAGE_GD_POINTER as u32) != 0
-            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_MOUSE as u32) != 0
-            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_TRACKPAD as u32) != 0;
-        if !is_pointer {
-            continue;
-        }
-        let vid = prop_int(service, KEY_VENDOR_ID).unwrap_or(0) as u32;
-        let pid = prop_int(service, KEY_PRODUCT_ID).unwrap_or(0) as u32;
-        let name = prop_string(service, KEY_PRODUCT);
-        let transport = prop_string(service, KEY_TRANSPORT);
-
-        let dev = Device {
-            identity: DeviceIdentity {
-                vendor_id: vid,
-                product_id: pid,
-                name,
-                transport,
-            },
-            service_client: service,
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let mut state = RegistryState {
+            client: std::ptr::null_mut(),
+            services: std::ptr::null_mut(),
+            devices: Vec::new(),
+            by_registry_id: HashMap::new(),
+            scheduled_rl: None,
         };
-        state.devices.push(dev);
-    }
+        // 一律新建 client:断连重连后旧 client 的注册表缓存过期,只有整体重建才可靠。
+        // Always create a fresh client: after a disconnect/reconnect the old client's registry
+        // cache is stale, and only a full rebuild is reliable.
+        let client = IOHIDEventSystemClientCreate(std::ptr::null());
+        if client.is_null() {
+            log_info!("[device] failed to create IOHIDEventSystemClient");
+            return state;
+        }
+        // 匹配 Generic Desktop 页(后续按 usage 过滤)。
+        // Match the Generic Desktop page (filtered by usage below).
+        let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
+        let page_val: *mut AnyObject =
+            msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
+        let dict: *mut AnyObject =
+            msg_send![class!(NSDictionary), dictionaryWithObject: page_val, forKey: page_key];
+        let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
+        IOHIDEventSystemClientSetMatchingMultiple(client, arr as *const c_void);
+        CFRelease(page_key as *const c_void);
+        // IOHIDEventSystemClient 的匹配是异步的:刚创建后立刻 CopyServices 可能拿到
+        // 空列表(实测枚举结果在 0/1 间摇摆)。等 ~30ms 让匹配完成,枚举才可靠。
+        // 该竞态只在新建 client 的路径出现;此 sleep 在 build_state 里,不持任何锁。
+        // Matching on IOHIDEventSystemClient is asynchronous: CopyServices right after
+        // creation can return an empty list (measured 0/1 flapping). Waiting ~30ms
+        // lets matching settle; only the fresh-client path has this race, and the sleep
+        // lives in build_state, holding no lock.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // 调度到鼠标线程 runloop:未调度的 client 的 registry-ID 映射不完整,归因用的
+        // CopyServiceForRegistryID 会持续返回 nil(实测),滚动事件归因失败后回退到
+        // "所有鼠标"档 —— per-device 设置(如反转滚动)在启动后不生效,直到重新枚举
+        // 出可用的 client。调度后匹配常驻,归因可靠(LinearMouse 同款做法)。
+        // Schedule the client on the mouse thread's runloop: an unscheduled client's
+        // registry-ID map is incomplete and CopyServiceForRegistryID keeps returning nil
+        // (measured), so scroll attribution fails and falls back to the "All Mice" profile --
+        // per-device settings (e.g. reverse scrolling) don't apply after startup until a
+        // working client is re-enumerated. Scheduling keeps the matching live and makes
+        // attribution reliable (same approach as LinearMouse).
+        if let Some(rl) = *mouse_runloop_static().lock().unwrap() {
+            crate::ffi::CFRetain(rl as *const c_void);
+            IOHIDEventSystemClientScheduleWithRunLoop(
+                client,
+                rl,
+                crate::mouse::ffi::kCFRunLoopDefaultMode,
+            );
+            state.scheduled_rl = Some(rl);
+        }
 
-    log_debug!(
-        "[device] enumerated {} pointer device(s).",
-        state.devices.len()
-    );
-    state
+        let services = IOHIDEventSystemClientCopyServices(client);
+        if services.is_null() {
+            // 拷贝失败:丢弃半成品(新 client 在这里释放),旧注册表保持可用。
+            // Copy failed: discard the half-built state (the fresh client is released here) and
+            // keep the old registry usable.
+            log_info!("[device] no services returned");
+            if let Some(rl) = state.scheduled_rl.take() {
+                IOHIDEventSystemClientUnscheduleWithRunLoop(
+                    client,
+                    rl,
+                    crate::mouse::ffi::kCFRunLoopDefaultMode,
+                );
+                CFRelease(rl as *const c_void);
+            }
+            CFRelease(client as *const c_void);
+            return state;
+        }
+        state.client = client;
+        state.services = services;
+
+        let count = CFArrayGetCount(services);
+        for i in 0..count {
+            let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
+            // 用 ConformsTo 判断是否指针/鼠标/触控板,不读 PrimaryUsage 单值。
+            // 原因:有些真实鼠标(如 ATK A9 SE 这类 Nearlink/星闪设备)的 PrimaryUsage 被
+            // 系统报成 Keyboard(6),白名单 {1,2,5} 会把它剔除;ConformsTo 检查整个
+            // DeviceUsagePairs,能识别它声明过的 Mouse(1,2)/Pointer(1,1)/Trackpad(1,5)。
+            // 副作用:少数键盘也声明了多余的 Mouse 用途(与 LinearMouse 行为一致),会一并
+            // 纳入;归因靠 senderID 精确匹配,不影响功能正确性。
+            //
+            // Determine pointer/mouse/trackpad via ConformsTo instead of the PrimaryUsage scalar.
+            // Some real mice (e.g. ATK A9 SE Nearlink devices) report PrimaryUsage = Keyboard(6),
+            // and a {1,2,5} whitelist would drop them; ConformsTo inspects the full DeviceUsagePairs
+            // and sees the Mouse(1,2)/Pointer(1,1)/Trackpad(1,5) usages they declare. Side effect:
+            // a few keyboards also declare extra Mouse usages (same as LinearMouse) and get included;
+            // attribution uses exact senderID matching, so this never affects correctness.
+            let is_pointer = IOHIDServiceClientConformsTo(service, 1, USAGE_GD_POINTER as u32) != 0
+                || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_MOUSE as u32) != 0
+                || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_TRACKPAD as u32) != 0;
+            if !is_pointer {
+                continue;
+            }
+            let vid = prop_int(service, KEY_VENDOR_ID).unwrap_or(0) as u32;
+            let pid = prop_int(service, KEY_PRODUCT_ID).unwrap_or(0) as u32;
+            let name = prop_string(service, KEY_PRODUCT);
+            let transport = prop_string(service, KEY_TRANSPORT);
+            if let Some(reg_id) = service_registry_id(service) {
+                state.by_registry_id.insert(reg_id, (vid, pid));
+            }
+
+            let dev = Device {
+                identity: DeviceIdentity {
+                    vendor_id: vid,
+                    product_id: pid,
+                    name,
+                    transport,
+                },
+                service_client: service,
+            };
+            state.devices.push(dev);
+        }
+
+        log_debug!(
+            "[device] enumerated {} pointer device(s).",
+            state.devices.len()
+        );
+        state
+    })
 }
 
 /// 短时持锁把新状态整体换入注册表,再释放被替换的旧 client/services。
@@ -308,17 +335,34 @@ unsafe fn swap_state(new: RegistryState) {
         // Build failed: keep the old registry instead of swapping.
         return;
     }
-    let mut reg = registry().lock().unwrap();
-    let old_client = reg.client;
-    let old_services = reg.services;
-    reg.client = new.client;
-    reg.services = new.services;
-    reg.devices = new.devices;
+    let (old_client, old_services, old_rl) = {
+        let mut reg = registry().lock().unwrap();
+        let old_client = reg.client;
+        let old_services = reg.services;
+        let old_rl = reg.scheduled_rl;
+        reg.client = new.client;
+        reg.services = new.services;
+        reg.devices = new.devices;
+        reg.by_registry_id = new.by_registry_id;
+        reg.missed_senders.clear();
+        reg.scheduled_rl = new.scheduled_rl;
+        (old_client, old_services, old_rl)
+    };
     if !old_services.is_null() {
         CFRelease(old_services as *const c_void);
     }
     if !old_client.is_null() {
+        if let Some(rl) = old_rl {
+            IOHIDEventSystemClientUnscheduleWithRunLoop(
+                old_client,
+                rl,
+                crate::mouse::ffi::kCFRunLoopDefaultMode,
+            );
+            CFRelease(rl as *const c_void);
+        }
         CFRelease(old_client as *const c_void);
+    } else if let Some(rl) = old_rl {
+        CFRelease(rl as *const c_void);
     }
 }
 
@@ -411,9 +455,13 @@ fn manager_static() -> &'static Mutex<*mut c_void> {
 /// always converges to the latest device list.
 struct PlugSignal {
     pending: bool,
+    last_run: Option<Instant>,
 }
 
-static PLUG_SIGNAL: Mutex<PlugSignal> = Mutex::new(PlugSignal { pending: false });
+static PLUG_SIGNAL: Mutex<PlugSignal> = Mutex::new(PlugSignal {
+    pending: false,
+    last_run: None,
+});
 static PLUG_CV: Condvar = Condvar::new();
 
 /// plug worker 只需启动一次(由 start_plug_monitor 惰性创建),线程与进程同寿命。
@@ -421,48 +469,21 @@ static PLUG_CV: Condvar = Condvar::new();
 /// process.
 static PLUG_WORKER: OnceLock<()> = OnceLock::new();
 
-/// 插拔处理防抖:启动时 IOHIDManager 会对在场设备触发一连串 matching 回调,而每次
-/// 处理(重建 client + 指针重应用)又会反向触发下一次回调,形成 6-7 连发的反馈循环 —— 既
-/// 刷日志噪音,又拉长繁忙窗口(macOS 对繁忙期未及时服务的 tap 会自动禁用,见
-/// event_tap.rs 的看门狗)。500ms 内只处理第一次,后续信号直接跳过,循环随之断开。
-/// 真实的重插拔周期远大于 500ms,不会误合并。防抖检查在 worker 侧执行(回调只转发信号)。
-///
-/// Plug-handling debounce: at startup IOHIDManager fires a burst of matching callbacks for
-/// on-screen devices, and each handling (client rebuild + pointer re-apply) triggers the next
-/// callback -- a 6-7 round feedback loop that spams the log and lengthens the busy window
-/// (macOS auto-disables taps that don't service events during that window; see the watchdog
-/// in event_tap.rs). Only the first signal within 500ms is handled; the rest are skipped,
-/// breaking the loop. Real re-plug cycles are far longer than 500ms, so no legitimate event
-/// gets merged away. The debounce check runs on the worker side (the callback only forwards
-/// a signal).
-static LAST_PLUG_HANDLE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 const PLUG_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// IOHIDManager 回调:设备接入/移除时只做信号转发,立即返回。重建 client(含 30ms
-/// settle)、重枚举、侧键释放与指针重应用全部移到 plug worker 线程;掉线风暴期间鼠标
-/// 线程的 event tap 不再被这些重活堵住(此前表现为滚动与侧键卡顿)。重建后要重新应用
-/// 指针加速设置:加速度属性写在旧的 IOHIDServiceClient 实例上,断连后随实例消失,
-/// 新实例恢复默认(加速度重新生效),必须在重连时重新 apply,否则"禁用指针加速"失效,
-/// 只能靠用户进设置手动点一次恢复(由 worker 侧的 pointer::apply 入队完成)。
-///
-/// IOHIDManager callback: on device attach/detach, forward a signal and return immediately.
-/// The client rebuild (including the 30ms settle), re-enumeration, side-button release and
-/// pointer re-apply all move to the plug worker thread; during disconnect storms the mouse
-/// thread's event tap is no longer blocked by that work (which used to stall scrolling and
-/// side buttons). Pointer acceleration must be re-applied on reconnect: the acceleration
-/// properties live on the old IOHIDServiceClient instance, which disappears on disconnect;
-/// the new instance reverts to defaults (acceleration back on). Without re-applying,
-/// "disable pointer acceleration" silently breaks until the user re-toggles it in Settings
-/// (done by enqueueing pointer::apply on the worker side).
+fn notify_plug_signal() {
+    let mut signal = PLUG_SIGNAL.lock().unwrap();
+    signal.pending = true;
+    PLUG_CV.notify_all();
+}
+
 unsafe extern "C" fn device_change_callback(
     _context: *mut c_void,
     _result: i32,
     _sender: *mut c_void,
     _callback: *mut c_void,
 ) {
-    let mut signal = PLUG_SIGNAL.lock().unwrap();
-    signal.pending = true;
-    PLUG_CV.notify_all();
+    notify_plug_signal();
 }
 
 /// 惰性启动 plug worker 线程(仅一次;在注册回调前调用,保证信号有消费者)。
@@ -474,12 +495,26 @@ fn ensure_plug_worker() {
             .name("device-plug".into())
             .spawn(|| loop {
                 let mut signal = PLUG_SIGNAL.lock().unwrap();
-                while !signal.pending {
-                    signal = PLUG_CV.wait(signal).unwrap();
+                loop {
+                    if !signal.pending {
+                        signal = PLUG_CV.wait(signal).unwrap();
+                        continue;
+                    }
+                    if let Some(last) = signal.last_run {
+                        let elapsed = last.elapsed();
+                        if elapsed < PLUG_DEBOUNCE {
+                            let remain = PLUG_DEBOUNCE - elapsed;
+                            let (s, _) = PLUG_CV.wait_timeout(signal, remain).unwrap();
+                            signal = s;
+                            continue;
+                        }
+                    }
+                    signal.pending = false;
+                    signal.last_run = Some(Instant::now());
+                    break;
                 }
-                signal.pending = false;
                 drop(signal);
-                unsafe { handle_plug_event() };
+                objc2::rc::autoreleasepool(|_| unsafe { handle_plug_event() });
             })
             .expect("failed to spawn device plug worker thread");
     });
@@ -489,15 +524,6 @@ fn ensure_plug_worker() {
 /// Handle one plug signal: debounce -> rebuild + swap the registry outside the lock ->
 /// release side buttons -> trigger the pointer re-apply.
 unsafe fn handle_plug_event() {
-    // 防抖(见 LAST_PLUG_HANDLE 注释):500ms 内的重复信号只处理第一次。
-    // Debounce (see LAST_PLUG_HANDLE): only the first signal within 500ms is handled.
-    {
-        let mut last = LAST_PLUG_HANDLE.lock().unwrap();
-        if last.is_some_and(|t| t.elapsed() < PLUG_DEBOUNCE) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
-    }
     let count = rebuild_and_swap();
     log_debug!(
         "[device] plug/unplug event: re-enumerated {} device(s).",
@@ -525,49 +551,82 @@ unsafe fn handle_plug_event() {
 /// and schedule it on the given RunLoop (the mouse thread's), so callbacks run on that thread.
 /// Matching mirrors enumeration: pointer/mouse/trackpad on the Generic Desktop page.
 pub(crate) unsafe fn start_plug_monitor(runloop: crate::mouse::ffi::CFRunLoopRef) {
-    let m = manager_static();
-    let mut m = m.lock().unwrap();
-    if !m.is_null() {
-        return;
-    }
-    // 记录鼠标线程 runloop,供 build_state 调度注册表 client(归因可靠性)。
-    // Record the mouse thread's runloop for build_state to schedule the registry client
-    // (attribution reliability).
-    *mouse_runloop_static().lock().unwrap() = Some(runloop);
-    // 先启动 plug worker(惰性,仅一次),再注册回调,信号必有消费者。
-    // Start the plug worker first (lazily, once), then register callbacks, so every signal
-    // has a consumer.
-    ensure_plug_worker();
-    let manager_obj = IOHIDManagerCreate(std::ptr::null(), 0);
-    if manager_obj.is_null() {
-        log_info!("[device] failed to create IOHIDManager");
-        return;
-    }
-    // matching:PrimaryUsagePage=Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad}。
-    // 与 build_state 的过滤一致。
-    // Matching: PrimaryUsagePage = Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad},
-    // mirroring build_state's filter.
-    let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
-    let page_val: *mut AnyObject =
-        msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
-    let dict: *mut AnyObject =
-        msg_send![class!(NSDictionary), dictionaryWithObject: page_val, forKey: page_key];
-    let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
-    IOHIDManagerSetDeviceMatchingMultiple(manager_obj, arr as *const c_void);
-    CFRelease(page_key as *const c_void);
+    objc2::rc::autoreleasepool(|_| unsafe {
+        crate::ffi::CFRetain(runloop as *const c_void);
+        let old_rl = mouse_runloop_static().lock().unwrap().replace(runloop);
+        // 先启动 plug worker(惰性,仅一次),再注册回调,信号必有消费者。
+        // Start the plug worker first (lazily, once), then register callbacks, so every signal
+        // has a consumer.
+        ensure_plug_worker();
 
-    let cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> = Some(
-        device_change_callback as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void),
-    );
-    IOHIDManagerRegisterDeviceMatchingCallback(manager_obj, cb, std::ptr::null_mut());
-    IOHIDManagerRegisterDeviceRemovalCallback(manager_obj, cb, std::ptr::null_mut());
-    IOHIDManagerScheduleWithRunLoop(
-        manager_obj,
-        runloop,
-        crate::mouse::ffi::kCFRunLoopDefaultMode,
-    );
-    *m = manager_obj;
-    log_info!("[device] plug/unplug monitor started.");
+        let m = manager_static();
+        let mut m = m.lock().unwrap();
+        if !m.is_null() {
+            if let Some(old) = old_rl {
+                if old != runloop {
+                    IOHIDManagerUnscheduleFromRunLoop(
+                        *m,
+                        old,
+                        crate::mouse::ffi::kCFRunLoopDefaultMode,
+                    );
+                }
+                CFRelease(old as *const c_void);
+            }
+            IOHIDManagerScheduleWithRunLoop(*m, runloop, crate::mouse::ffi::kCFRunLoopDefaultMode);
+            drop(m);
+            notify_plug_signal();
+            return;
+        }
+        if let Some(old) = old_rl {
+            CFRelease(old as *const c_void);
+        }
+
+        let manager_obj = IOHIDManagerCreate(std::ptr::null(), 0);
+        if manager_obj.is_null() {
+            log_info!("[device] failed to create IOHIDManager");
+            return;
+        }
+        // matching:PrimaryUsagePage=Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad}。
+        // 与 build_state 的过滤一致。
+        // Matching: PrimaryUsagePage = Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad},
+        // mirroring build_state's filter.
+        let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
+        let page_val: *mut AnyObject =
+            msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
+        let dict: *mut AnyObject =
+            msg_send![class!(NSDictionary), dictionaryWithObject: page_val, forKey: page_key];
+        let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
+        IOHIDManagerSetDeviceMatchingMultiple(manager_obj, arr as *const c_void);
+        CFRelease(page_key as *const c_void);
+
+        let cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> = Some(
+            device_change_callback
+                as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void),
+        );
+        IOHIDManagerRegisterDeviceMatchingCallback(manager_obj, cb, std::ptr::null_mut());
+        IOHIDManagerRegisterDeviceRemovalCallback(manager_obj, cb, std::ptr::null_mut());
+        IOHIDManagerScheduleWithRunLoop(
+            manager_obj,
+            runloop,
+            crate::mouse::ffi::kCFRunLoopDefaultMode,
+        );
+        *m = manager_obj;
+        log_info!("[device] plug/unplug monitor started.");
+    });
+}
+
+pub(crate) unsafe fn detach_plug_monitor(runloop: crate::mouse::ffi::CFRunLoopRef) {
+    let m = manager_static().lock().unwrap();
+    if !m.is_null() {
+        IOHIDManagerUnscheduleFromRunLoop(*m, runloop, crate::mouse::ffi::kCFRunLoopDefaultMode);
+    }
+    drop(m);
+    let mut slot = mouse_runloop_static().lock().unwrap();
+    if *slot == Some(runloop) {
+        if let Some(rl) = slot.take() {
+            CFRelease(rl as *const c_void);
+        }
+    }
 }
 
 // ========== 归因 / attribution ==========
@@ -624,34 +683,29 @@ pub(crate) fn device_from_cgevent(cg_event: crate::mouse::ffi::CGEventRef) -> Op
         if sender == 0 {
             return last_active_key();
         }
-        // 第一次查表。
-        // First lookup.
+        let mut trigger_rebuild = false;
         {
-            let reg = registry().lock().unwrap();
-            if let Some(idx) = lookup_service_index(&reg, sender) {
-                let dev = &reg.devices[idx];
-                *LAST_ACTIVE_KEY.lock().unwrap() = Some(dev.key());
-                return Some(dev.key());
+            let mut reg = registry().lock().unwrap();
+            if let Some(&key) = reg.by_registry_id.get(&sender) {
+                drop(reg);
+                *LAST_ACTIVE_KEY.lock().unwrap() = Some(key);
+                return Some(key);
+            }
+            if !reg.missed_senders.contains(&sender) {
+                if let Some(idx) = lookup_service_index(&reg, sender) {
+                    let key = reg.devices[idx].key();
+                    reg.by_registry_id.insert(sender, key);
+                    drop(reg);
+                    *LAST_ACTIVE_KEY.lock().unwrap() = Some(key);
+                    return Some(key);
+                }
+                reg.missed_senders.insert(sender);
+                trigger_rebuild = true;
             }
         }
-        // 未命中:可能新设备插入或断连重连后注册表过期。锁外重建 client + 重枚举,再短时
-        // 持锁交换后重查;绝不持锁 sleep。只重枚举不重建 client 是不够的:重连后旧 client
-        // 的缓存已失效,重枚举拿到的仍是过期列表,归因会持续失败(表现为每次事件都重枚举
-        // 仍不命中)。
-        // Miss: a newly-plugged device or a reconnect may have made the registry stale.
-        // Rebuild the client + re-enumerate outside the lock, swap under a brief lock, then
-        // retry; never sleep while holding the lock. Re-enumerating with the old client is not
-        // enough: after a reconnect the old client's cache is dead, so the re-enumeration still
-        // yields a stale list and attribution keeps failing (observable as a re-enumeration on
-        // every event that still misses).
-        {
-            rebuild_and_swap();
-            let reg = registry().lock().unwrap();
-            if let Some(idx) = lookup_service_index(&reg, sender) {
-                let dev = &reg.devices[idx];
-                *LAST_ACTIVE_KEY.lock().unwrap() = Some(dev.key());
-                return Some(dev.key());
-            }
+        if trigger_rebuild {
+            ensure_plug_worker();
+            notify_plug_signal();
         }
         last_active_key()
     }

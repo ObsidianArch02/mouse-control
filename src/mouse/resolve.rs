@@ -17,6 +17,7 @@ use crate::mouse::buttons::{self, PressedKey};
 use crate::mouse::device::DeviceKey;
 use crate::mouse::scrolling::ScrollMode;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
 /// 解析后的具体生效配置(非 Option,所有字段已定)。
@@ -66,12 +67,57 @@ static CACHE: std::sync::LazyLock<
     Mutex<std::collections::HashMap<ResolveCacheKey, ResolvedMouse>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+const FLAG_COMPUTED: u8 = 1 << 0;
+const FLAG_APP_SCROLL: u8 = 1 << 1;
+const FLAG_APP_POINTER: u8 = 1 << 2;
+
+static APP_PROFILE_FLAGS: AtomicU8 = AtomicU8::new(0);
+
 /// 使缓存失效(配置重载或设备变更时调用)。
 /// Invalidate the cache (called on config reload or device changes).
 pub(crate) fn invalidate_cache() {
+    APP_PROFILE_FLAGS.store(0, Ordering::Release);
     if let Ok(mut c) = CACHE.lock() {
         c.clear();
     }
+}
+
+fn app_profile_flags() -> u8 {
+    let flags = APP_PROFILE_FLAGS.load(Ordering::Acquire);
+    if flags & FLAG_COMPUTED != 0 {
+        return flags;
+    }
+    let cfg = CONFIG.read().unwrap();
+    let mut computed = FLAG_COMPUTED;
+    for p in &cfg.mouse.profiles {
+        if p.app_bundle_id.is_none() && p.app_name.is_none() {
+            continue;
+        }
+        if p.reverse_scroll.is_some()
+            || p.scroll_mode.is_some()
+            || p.line_count.is_some()
+            || p.line_height.is_some()
+        {
+            computed |= FLAG_APP_SCROLL;
+        }
+        if p.pointer
+            .as_ref()
+            .and_then(|ptr| ptr.disable_acceleration)
+            .is_some()
+        {
+            computed |= FLAG_APP_POINTER;
+        }
+    }
+    APP_PROFILE_FLAGS.store(computed, Ordering::Release);
+    computed
+}
+
+pub(crate) fn has_per_app_scroll_profiles() -> bool {
+    app_profile_flags() & FLAG_APP_SCROLL != 0
+}
+
+pub(crate) fn has_per_app_pointer_profiles() -> bool {
+    app_profile_flags() & FLAG_APP_POINTER != 0
 }
 
 /// 匹配器是否匹配给定设备。None 键 = 通配(匹配所有设备,即"所有鼠标"档)。

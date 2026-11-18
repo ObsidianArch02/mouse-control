@@ -192,6 +192,9 @@ pub(crate) const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
 
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const K_CF_NUMBER_SINT64_TYPE: isize = 4;
+
 /// CFNumberType 的 kCFNumberIntType = 9(枚举常量不是导出符号,直接用值)。
 /// CFNumberType kCFNumberIntType = 9 (an enum constant, not an exported symbol; raw value).
 #[cfg_attr(test, allow(dead_code))]
@@ -390,6 +393,12 @@ extern "C" {
         runloop: CFRunLoopRef,
         mode: *const c_void,
     );
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn IOHIDEventSystemClientUnscheduleWithRunLoop(
+        client: *mut c_void,
+        runloop: CFRunLoopRef,
+        mode: *const c_void,
+    );
 }
 
 // ========== 事件归因:IOHIDEvent sender ID(私有 SPI)/ Event attribution ==========
@@ -446,10 +455,18 @@ extern "C" {
         runloop: *const c_void,
         mode: *const c_void,
     );
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn IOHIDManagerUnscheduleFromRunLoop(
+        manager: *mut c_void,
+        runloop: *const c_void,
+        mode: *const c_void,
+    );
 }
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn IOHIDServiceClientGetRegistryID(client: *mut c_void) -> *const c_void;
     // CopyProperty 返回 +1 CFTypeRef,调用方负责 CFRelease。
     // CopyProperty returns +1 CFTypeRef; caller must CFRelease.
     pub(crate) fn IOHIDServiceClientCopyProperty(
@@ -478,6 +495,28 @@ extern "C" {
         usage_page: u32,
         usage: u32,
     ) -> i32;
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) unsafe fn service_registry_id(service: *mut c_void) -> Option<u64> {
+    if service.is_null() {
+        return None;
+    }
+    let num = IOHIDServiceClientGetRegistryID(service);
+    if num.is_null() {
+        return None;
+    }
+    let mut id: u64 = 0;
+    if CFNumberGetValue(
+        num,
+        K_CF_NUMBER_SINT64_TYPE,
+        &mut id as *mut u64 as *mut c_void,
+    ) && id != 0
+    {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 // ========== CFArray 遍历 / CFArray iteration ==========

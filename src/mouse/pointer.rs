@@ -49,6 +49,7 @@ use crate::mouse::resolve;
 use crate::{log_debug, log_info};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
@@ -59,12 +60,15 @@ struct SavedProp {
     /// IOHIDServiceClientRef(借用自 services 数组,由 PointerState 保活)。
     /// IOHIDServiceClientRef (borrowed from the services array; kept alive by PointerState).
     service: *mut c_void,
+    registry_id: u64,
+    key_name: &'static str,
     /// NSString 属性键(+1,restore 时 release)。
     /// NSString property key (+1, released on restore).
     key: *mut AnyObject,
     /// 原值(+1,restore 时 set 回再 release);None = 属性原本不存在。
     /// Original value (+1, set back then released on restore); None = property didn't exist.
     original: Option<*mut c_void>,
+    target_val: i64,
 }
 
 /// 已应用的指针状态:持有 event system client 与 services 数组(保活 service client),外加 saved 列表。
@@ -258,18 +262,19 @@ fn exit_dropout_logged() {
 /// One apply cycle on the worker: restore originals first, then re-apply based on the
 /// current config and the devices actually present.
 fn run_apply_cycle(cancel_gen: u64) {
-    let enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
-    if !enabled {
-        restore_state();
-        return;
-    }
-    restore_state();
-    let outcome = unsafe { disable_once(cancel_gen) };
-    match outcome {
-        ApplyOutcome::Applied => exit_dropout_logged(),
-        ApplyOutcome::NoPointerDevices => enter_dropout_once(),
-        ApplyOutcome::NoTargetDevices => {}
-    }
+    objc2::rc::autoreleasepool(|_| {
+        let enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
+        if !enabled {
+            restore_state();
+            return;
+        }
+        let outcome = unsafe { reconcile_once(cancel_gen) };
+        match outcome {
+            ApplyOutcome::Applied => exit_dropout_logged(),
+            ApplyOutcome::NoPointerDevices => enter_dropout_once(),
+            ApplyOutcome::NoTargetDevices | ApplyOutcome::WriteFailed => {}
+        }
+    });
 }
 
 /// 单次 disable 的结果分类。
@@ -287,6 +292,7 @@ enum ApplyOutcome {
     /// Pointer devices exist but none asks to disable acceleration: a normal no-op, not a
     /// dropout.
     NoTargetDevices,
+    WriteFailed,
 }
 
 /// 写入整数属性并读回校验;失败按 250ms 退避重试,上限 5 次。设备中途消失时校验自然
@@ -344,17 +350,7 @@ unsafe fn apply_prop_verified(
 /// One disable pass: enumerate mouse/trackpad devices, save originals and set the
 /// linear-scaling switch, verifying every write by read-back. Runs on the apply worker
 /// thread, so the four apply call sites are never blocked.
-unsafe fn disable_once(cancel_gen: u64) -> ApplyOutcome {
-    // 幂等护栏:已应用时不重复写(正常周期会先 restore_state 清空,这里只防路径外调用)。
-    // Idempotence guard: never double-write over an applied state (a normal cycle clears it
-    // via restore_state first; this only guards out-of-band calls).
-    if POINTER_STATE.lock().unwrap().is_some() {
-        return ApplyOutcome::Applied;
-    }
-
-    // 创建 event system client,匹配 Generic Desktop 页(鼠标/键盘/触控板等,后续按 usage 过滤)。
-    // Create the event system client, matching the Generic Desktop page (mice/keyboards/trackpads;
-    // filtered by usage below).
+unsafe fn reconcile_once(cancel_gen: u64) -> ApplyOutcome {
     let client = IOHIDEventSystemClientCreate(std::ptr::null());
     if client.is_null() {
         log_info!("[pointer] failed to create IOHIDEventSystemClient");
@@ -380,6 +376,11 @@ unsafe fn disable_once(cancel_gen: u64) -> ApplyOutcome {
     // thread and blocks neither the main thread nor the mouse thread.
     std::thread::sleep(std::time::Duration::from_millis(30));
 
+    if apply_cancelled(cancel_gen) {
+        CFRelease(client as *const c_void);
+        return ApplyOutcome::NoTargetDevices;
+    }
+
     let services = IOHIDEventSystemClientCopyServices(client);
     if services.is_null() {
         log_info!("[pointer] no services returned by IOHIDEventSystemClient");
@@ -390,13 +391,23 @@ unsafe fn disable_once(cancel_gen: u64) -> ApplyOutcome {
         return ApplyOutcome::NoPointerDevices;
     }
 
+    let old_state = POINTER_STATE.lock().unwrap().take();
+    let (old_client, old_services, mut old_saved) = match old_state {
+        Some(s) => (Some(s.client), Some(s.services), s.saved),
+        None => (None, None, Vec::new()),
+    };
+
     // 遍历 services(CFArrayRef)。用 C 函数,不用 msg_send!(objectAtIndex:),
     // 避免 objc2 的类型编码校验 panic(方法返回 '@',Rust 声明 '^v')。
     // Iterate services (CFArrayRef) with C functions, not msg_send!(objectAtIndex:),
     // to avoid objc2's type-encoding panic (method returns '@', Rust declares '^v').
     let count = CFArrayGetCount(services);
-    let mut saved: Vec<SavedProp> = Vec::new();
+    let mut new_saved: Vec<SavedProp> = Vec::new();
+    let mut live_reg_ids: HashSet<u64> = HashSet::new();
     let mut pointer_count: usize = 0;
+    let mut target_count: usize = 0;
+    let mut verified_count: usize = 0;
+    let active_app = app::active_identity();
 
     for i in 0..count {
         let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
@@ -413,13 +424,17 @@ unsafe fn disable_once(cancel_gen: u64) -> ApplyOutcome {
             continue;
         }
         pointer_count += 1;
+        let reg_id = service_registry_id(service).unwrap_or(0);
+        if reg_id != 0 {
+            live_reg_ids.insert(reg_id);
+        }
         let name = device_name(service);
 
         // 读取 VID/PID,解析该设备是否需要禁用加速(per-device 配置)。
         // Read VID/PID and resolve whether this device should have acceleration disabled.
         let vid = prop_int(service, KEY_VENDOR_ID) as u32;
         let pid = prop_int(service, KEY_PRODUCT_ID) as u32;
-        let resolved = resolve::resolve(Some((vid, pid)), app::active_identity());
+        let resolved = resolve::resolve(Some((vid, pid)), active_app.clone());
         if !resolved.disable_acceleration {
             // 该设备的配置未要求禁用加速,跳过(保留系统默认)。
             // This device's config doesn't ask to disable acceleration; skip (keep system default).
@@ -431,50 +446,102 @@ unsafe fn disable_once(cancel_gen: u64) -> ApplyOutcome {
             );
             continue;
         }
+        target_count += 1;
 
-        // macOS 14+ (Sonoma):线性缩放开关。
-        // macOS 14+ (Sonoma): the linear-scaling switch.
-        if prop_exists(service, KEY_LINEAR_SCALING) {
-            let original = copy_prop(service, KEY_LINEAR_SCALING).unwrap();
-            let ok = apply_prop_verified(service, KEY_LINEAR_SCALING, 1, &name, cancel_gen);
-            log_debug!(
-                "[pointer] {}: linear scaling ON (original saved, ok={})",
-                name,
-                ok
-            );
-            saved.push(SavedProp {
+        let (key_name, target_val) = if prop_exists(service, KEY_LINEAR_SCALING) {
+            (KEY_LINEAR_SCALING, 1i64)
+        } else if prop_exists(service, KEY_POINTER_ACCEL) {
+            (KEY_POINTER_ACCEL, -65536i64)
+        } else {
+            (KEY_MOUSE_ACCEL, -65536i64)
+        };
+
+        let existing_idx = old_saved.iter().position(|sp| {
+            sp.key_name == key_name
+                && if reg_id != 0 && sp.registry_id != 0 {
+                    sp.registry_id == reg_id
+                } else {
+                    crate::ffi::CFEqual(sp.service, service)
+                }
+        });
+        if let Some(idx) = existing_idx {
+            let prev = old_saved.swap_remove(idx);
+            let already_ok =
+                prev.target_val == target_val && verify_prop(service, key_name, target_val);
+            let ok = if already_ok {
+                true
+            } else {
+                apply_prop_verified(service, key_name, target_val, &name, cancel_gen)
+            };
+            if ok {
+                verified_count += 1;
+            }
+            new_saved.push(SavedProp {
                 service,
-                key: make_nsstring(KEY_LINEAR_SCALING),
-                original: Some(original),
+                registry_id: reg_id,
+                key_name,
+                key: prev.key,
+                original: prev.original,
+                target_val,
             });
             continue;
         }
 
-        // 旧系统回退:加速属性 = -1 (IOFixed:值 × 65536)。优先 HIDPointerAcceleration,
-        // 不存在则用 HIDMouseAcceleration。
-        // Legacy fallback: acceleration = -1 (IOFixed: value × 65536). Prefer
-        // HIDPointerAcceleration, else HIDMouseAcceleration.
-        let accel_key = if prop_exists(service, KEY_POINTER_ACCEL) {
-            KEY_POINTER_ACCEL
-        } else {
-            KEY_MOUSE_ACCEL
-        };
-        let original = copy_prop(service, accel_key);
-        let ok = apply_prop_verified(service, accel_key, -65536, &name, cancel_gen);
+        let original = copy_prop(service, key_name);
+        if key_name == KEY_LINEAR_SCALING && original.is_none() {
+            continue;
+        }
+        let ok = apply_prop_verified(service, key_name, target_val, &name, cancel_gen);
         log_debug!(
-            "[pointer] {}: acceleration -> -1 via {} (ok={})",
+            "[pointer] {}: {} -> {} (ok={})",
             name,
-            accel_key,
+            key_name,
+            target_val,
             ok
         );
-        saved.push(SavedProp {
-            service,
-            key: make_nsstring(accel_key),
-            original,
-        });
+        if ok {
+            verified_count += 1;
+            new_saved.push(SavedProp {
+                service,
+                registry_id: reg_id,
+                key_name,
+                key: make_nsstring(key_name),
+                original,
+                target_val,
+            });
+        } else if let Some(orig) = original {
+            CFRelease(orig as *const c_void);
+        }
     }
 
-    if saved.is_empty() {
+    for sp in old_saved {
+        let key_cf = sp.key as *const c_void;
+        let still_live = sp.registry_id == 0 || live_reg_ids.contains(&sp.registry_id);
+        if still_live {
+            match sp.original {
+                Some(orig) => {
+                    let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, orig);
+                    log_debug!("[pointer] restored original property (ok={})", ok);
+                }
+                None => {
+                    let zero: *mut AnyObject = msg_send![class!(NSNumber), numberWithInt: 0];
+                    IOHIDServiceClientSetProperty(sp.service, key_cf, zero as *mut c_void);
+                }
+            }
+        }
+        if let Some(orig) = sp.original {
+            CFRelease(orig as *const c_void);
+        }
+        CFRelease(key_cf);
+    }
+    if let Some(s) = old_services {
+        CFRelease(s as *const c_void);
+    }
+    if let Some(c) = old_client {
+        CFRelease(c as *const c_void);
+    }
+
+    if new_saved.is_empty() {
         CFRelease(services as *const c_void);
         CFRelease(client as *const c_void);
         if pointer_count == 0 {
@@ -483,52 +550,61 @@ unsafe fn disable_once(cancel_gen: u64) -> ApplyOutcome {
             // dropout state machine instead of a failure log.
             return ApplyOutcome::NoPointerDevices;
         }
-        return ApplyOutcome::NoTargetDevices;
+        if target_count == 0 {
+            return ApplyOutcome::NoTargetDevices;
+        }
+        return ApplyOutcome::WriteFailed;
     }
 
     log_debug!(
         "[pointer] disabled acceleration on {} device(s).",
-        saved.len()
+        new_saved.len()
     );
     *POINTER_STATE.lock().unwrap() = Some(PointerState {
         client,
         services,
-        saved,
+        saved: new_saved,
     });
-    ApplyOutcome::Applied
+    if verified_count > 0 {
+        ApplyOutcome::Applied
+    } else {
+        ApplyOutcome::WriteFailed
+    }
 }
 
 /// 恢复原始加速设置(内部实现,持有调用约定:与在途 apply 互斥由调用方保证)。
 /// Restore the original acceleration settings (implementation; the caller guarantees mutual
 /// exclusion with any in-flight apply).
 fn restore_state() {
-    let mut guard = POINTER_STATE.lock().unwrap();
-    let Some(state) = guard.take() else {
-        return;
-    };
-    unsafe {
-        for sp in state.saved {
-            let key_cf = sp.key as *const c_void;
-            match sp.original {
-                Some(orig) => {
-                    let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, orig);
-                    log_debug!("[pointer] restored original property (ok={})", ok);
-                    CFRelease(orig as *const c_void);
+    objc2::rc::autoreleasepool(|_| {
+        let mut guard = POINTER_STATE.lock().unwrap();
+        let Some(state) = guard.take() else {
+            return;
+        };
+        unsafe {
+            for sp in state.saved {
+                let key_cf = sp.key as *const c_void;
+                match sp.original {
+                    Some(orig) => {
+                        let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, orig);
+                        log_debug!("[pointer] restored original property (ok={})", ok);
+                        CFRelease(orig as *const c_void);
+                    }
+                    None => {
+                        // 原值不存在:设 0(等效关闭我们设置的开关);极少见的旧系统边界情况。
+                        // Original didn't exist: set 0 (equivalent to disabling what we set);
+                        // a rare legacy edge case.
+                        let zero: *mut AnyObject = msg_send![class!(NSNumber), numberWithInt: 0];
+                        IOHIDServiceClientSetProperty(sp.service, key_cf, zero as *mut c_void);
+                    }
                 }
-                None => {
-                    // 原值不存在:设 0(等效关闭我们设置的开关);极少见的旧系统边界情况。
-                    // Original didn't exist: set 0 (equivalent to disabling what we set);
-                    // a rare legacy edge case.
-                    let zero: *mut AnyObject = msg_send![class!(NSNumber), numberWithInt: 0];
-                    IOHIDServiceClientSetProperty(sp.service, key_cf, zero as *mut c_void);
-                }
+                CFRelease(key_cf);
             }
-            CFRelease(key_cf);
+            CFRelease(state.services as *const c_void);
+            CFRelease(state.client as *const c_void);
         }
-        CFRelease(state.services as *const c_void);
-        CFRelease(state.client as *const c_void);
-    }
-    log_debug!("[pointer] restored original acceleration settings.");
+        log_debug!("[pointer] restored original acceleration settings.");
+    });
 }
 
 /// 取消待处理的 apply 并等待在途周期结束。pending 直接清零(合并窗口内的请求作废);

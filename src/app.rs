@@ -21,8 +21,10 @@ use crate::{log_debug, log_info};
 use objc2::rc::autoreleasepool;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
+use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// 当前前台 app 的稳定身份。字段来自 NSRunningApplication;无 bundle 的小工具/脚本只有
 /// localized_name,两者都缺失时 per-app 档只会命中无 app 字段的全局/设备档。
@@ -36,6 +38,38 @@ pub(crate) struct AppIdentity {
 }
 
 static ACTIVE_APP: Mutex<Option<AppIdentity>> = Mutex::new(None);
+static PID_MAP: std::sync::LazyLock<Mutex<HashMap<i32, AppIdentity>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct WindowRect {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    pid: i32,
+}
+
+struct WindowSnapshot {
+    windows: Vec<WindowRect>,
+    updated_at: Option<Instant>,
+}
+
+static WINDOW_SNAPSHOT: std::sync::LazyLock<Mutex<WindowSnapshot>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(WindowSnapshot {
+            windows: Vec::new(),
+            updated_at: None,
+        })
+    });
+
+struct SnapSignal {
+    pending: bool,
+}
+
+static SNAP_SIGNAL: Mutex<SnapSignal> = Mutex::new(SnapSignal { pending: false });
+static SNAP_CV: Condvar = Condvar::new();
+static SNAP_WORKER: OnceLock<()> = OnceLock::new();
+const WINDOW_SNAPSHOT_TTL: Duration = Duration::from_millis(200);
 
 /// 返回当前缓存的 app 身份。供鼠标线程 resolve 使用,只读 Mutex,不调用 AppKit。
 /// Return the cached app identity. Used by the mouse thread for resolution; read-only Mutex,
@@ -122,21 +156,64 @@ unsafe fn identity_from_running_app(app: *mut AnyObject) -> AppIdentity {
 /// identity_from_running_app. None when nothing matches (desktop / menu bar / Dock, or an
 /// owner without a NSRunningApplication); callers fall back to frontmost-app attribution.
 pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
-    // 鼠标线程没有 autorelease pool,查询过程产生的临时 ObjC 对象在这里统一释放。
-    // The mouse thread has no autorelease pool; temporary ObjC objects produced by the
-    // lookup are drained here.
-    autoreleasepool(|_| unsafe { identity_at_point_impl(x, y) })
+    let (pid, stale) = {
+        let snap = WINDOW_SNAPSHOT.lock().unwrap();
+        let stale = snap
+            .updated_at
+            .is_none_or(|t| t.elapsed() >= WINDOW_SNAPSHOT_TTL);
+        let pid = snap
+            .windows
+            .iter()
+            .find(|w| x >= w.x0 && x < w.x1 && y >= w.y0 && y < w.y1)
+            .map(|w| w.pid);
+        (pid, stale)
+    };
+    if stale {
+        request_snapshot_refresh(false);
+    }
+    let pid = pid?;
+    PID_MAP.lock().unwrap().get(&pid).cloned()
 }
 
-unsafe fn identity_at_point_impl(x: f64, y: f64) -> Option<AppIdentity> {
+fn ensure_snap_worker() {
+    SNAP_WORKER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("window-snap".into())
+            .spawn(|| loop {
+                let mut s = SNAP_SIGNAL.lock().unwrap();
+                while !s.pending {
+                    s = SNAP_CV.wait(s).unwrap();
+                }
+                s.pending = false;
+                drop(s);
+                let windows = autoreleasepool(|_| unsafe { capture_window_rects() });
+                let mut snap = WINDOW_SNAPSHOT.lock().unwrap();
+                snap.windows = windows;
+                snap.updated_at = Some(Instant::now());
+            })
+            .expect("failed to spawn window snapshot worker thread");
+    });
+}
+
+fn request_snapshot_refresh(invalidate: bool) {
+    if invalidate {
+        WINDOW_SNAPSHOT.lock().unwrap().updated_at = None;
+    }
+    ensure_snap_worker();
+    let mut s = SNAP_SIGNAL.lock().unwrap();
+    s.pending = true;
+    SNAP_CV.notify_all();
+}
+
+unsafe fn capture_window_rects() -> Vec<WindowRect> {
     let list = CGWindowListCopyWindowInfo(
         K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
         0,
     );
     if list.is_null() {
-        return None;
+        return Vec::new();
     }
-    let mut hit = None;
+    let mut out = Vec::new();
     let count = CFArrayGetCount(list);
     for i in 0..count {
         let window = CFArrayGetValueAtIndex(list, i);
@@ -158,32 +235,41 @@ unsafe fn identity_at_point_impl(x: f64, y: f64) -> Option<AppIdentity> {
         {
             continue;
         }
-        let inside = x >= bounds.origin.x
-            && x < bounds.origin.x + bounds.size.width
-            && y >= bounds.origin.y
-            && y < bounds.origin.y + bounds.size.height;
-        if !inside {
-            continue;
-        }
-        // 命中:属主 PID -> NSRunningApplication -> 现有身份提取;属主不是常规 GUI app
-        // 时继续看下一个窗口。
-        // Hit: owner PID -> NSRunningApplication -> the existing identity extraction;
-        // move on to the next window when the owner is not a regular GUI app.
         let Some(pid) = read_dict_int(window, kCGWindowOwnerPID) else {
             continue;
         };
-        let app: *mut AnyObject = msg_send![
-            class!(NSRunningApplication),
-            runningApplicationWithProcessIdentifier: pid
-        ];
-        if app.is_null() {
-            continue;
-        }
-        hit = Some(identity_from_running_app(app));
-        break;
+        out.push(WindowRect {
+            x0: bounds.origin.x,
+            y0: bounds.origin.y,
+            x1: bounds.origin.x + bounds.size.width,
+            y1: bounds.origin.y + bounds.size.height,
+            pid,
+        });
     }
     CFRelease(list);
-    hit
+    out
+}
+
+unsafe fn seed_pid_map() {
+    autoreleasepool(|_| unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let apps: *mut AnyObject = msg_send![workspace, runningApplications];
+        if apps.is_null() {
+            return;
+        }
+        let count = CFArrayGetCount(apps as *const c_void);
+        let mut map = PID_MAP.lock().unwrap();
+        for i in 0..count {
+            let app = CFArrayGetValueAtIndex(apps as *const c_void, i) as *mut AnyObject;
+            if app.is_null() {
+                continue;
+            }
+            let pid: i32 = msg_send![app, processIdentifier];
+            if pid > 0 {
+                map.insert(pid, identity_from_running_app(app));
+            }
+        }
+    });
 }
 
 /// 从窗口 CFDictionary 读 i32 值(kCGWindowLayer / kCGWindowOwnerPID 都是 CFNumber)。
@@ -222,18 +308,29 @@ fn observer_target() -> &'static Mutex<Option<*mut AnyObject>> {
         .0
 }
 
-extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
+extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
     // 通知携带的 app 是权威值;极少数缺失 userInfo 的情况回退到 frontmostApplication。
     // The app carried by the notification is authoritative; fall back only when its
     // userInfo is missing.
-    let identity = unsafe {
-        let app = app_from_notification(_notification);
+    let (identity, pid) = unsafe {
+        let app = app_from_notification(notification);
         if app.is_null() {
-            refresh_from_frontmost()
+            let f = frontmost_application();
+            let pid: i32 = if f.is_null() {
+                0
+            } else {
+                msg_send![f, processIdentifier]
+            };
+            (identity_from_running_app(f), pid)
         } else {
-            identity_from_running_app(app)
+            let pid: i32 = msg_send![app, processIdentifier];
+            (identity_from_running_app(app), pid)
         }
     };
+    if pid > 0 {
+        PID_MAP.lock().unwrap().insert(pid, identity.clone());
+    }
+    request_snapshot_refresh(true);
     if !set_active(identity) {
         return;
     }
@@ -247,7 +344,38 @@ extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, _notification
     crate::mouse::resolve::invalidate_cache();
     // 指针加速可能按 app 覆盖,切 app 时重算并重应用。
     // Pointer acceleration may be overridden per app; re-evaluate and re-apply on switch.
-    crate::mouse::pointer::apply();
+    if crate::mouse::resolve::has_per_app_pointer_profiles() {
+        crate::mouse::pointer::apply();
+    }
+}
+
+extern "C" fn handle_app_launch(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
+    unsafe {
+        let app = app_from_notification(notification);
+        if !app.is_null() {
+            let pid: i32 = msg_send![app, processIdentifier];
+            if pid > 0 {
+                PID_MAP
+                    .lock()
+                    .unwrap()
+                    .insert(pid, identity_from_running_app(app));
+            }
+        }
+    }
+    request_snapshot_refresh(false);
+}
+
+extern "C" fn handle_app_terminate(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
+    unsafe {
+        let app = app_from_notification(notification);
+        if !app.is_null() {
+            let pid: i32 = msg_send![app, processIdentifier];
+            if pid > 0 {
+                PID_MAP.lock().unwrap().remove(&pid);
+            }
+        }
+    }
+    request_snapshot_refresh(true);
 }
 
 unsafe fn install_observer() {
@@ -269,6 +397,18 @@ unsafe fn install_observer() {
         handle_app_activation as *mut c_void,
         types.as_ptr(),
     );
+    class_addMethod(
+        cls,
+        sel!(handleWorkspaceDidLaunchApplication:),
+        handle_app_launch as *mut c_void,
+        types.as_ptr(),
+    );
+    class_addMethod(
+        cls,
+        sel!(handleWorkspaceDidTerminateApplication:),
+        handle_app_terminate as *mut c_void,
+        types.as_ptr(),
+    );
     objc_registerClassPair(cls);
 
     let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
@@ -286,15 +426,30 @@ unsafe fn install_observer() {
     // otherwise the activation notifications never arrive.
     let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
     let center: *mut AnyObject = msg_send![workspace, notificationCenter];
-    let notification_name = make_nsstring("NSWorkspaceDidActivateApplicationNotification");
-    let _: () = msg_send![
-        center,
-        addObserver: target,
-        selector: sel!(handleWorkspaceDidActivateApplication:),
-        name: notification_name,
-        object: std::ptr::null::<AnyObject>()
-    ];
-    CFRelease(notification_name as *const c_void);
+    for (notif_name, selector) in [
+        (
+            "NSWorkspaceDidActivateApplicationNotification",
+            sel!(handleWorkspaceDidActivateApplication:),
+        ),
+        (
+            "NSWorkspaceDidLaunchApplicationNotification",
+            sel!(handleWorkspaceDidLaunchApplication:),
+        ),
+        (
+            "NSWorkspaceDidTerminateApplicationNotification",
+            sel!(handleWorkspaceDidTerminateApplication:),
+        ),
+    ] {
+        let notification_name = make_nsstring(notif_name);
+        let _: () = msg_send![
+            center,
+            addObserver: target,
+            selector: selector,
+            name: notification_name,
+            object: std::ptr::null::<AnyObject>()
+        ];
+        CFRelease(notification_name as *const c_void);
+    }
     log_info!("[app] active-app notification observer installed.");
 }
 
@@ -303,9 +458,11 @@ unsafe fn install_observer() {
 /// registers the activation observer.
 pub(crate) fn start_monitor() {
     unsafe {
+        seed_pid_map();
         let initial = refresh_from_frontmost();
         set_active(initial);
         install_observer();
     }
+    request_snapshot_refresh(true);
     log_debug!("[app] active-app monitor started: {:?}", active_identity());
 }

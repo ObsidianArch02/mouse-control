@@ -29,7 +29,7 @@ use crate::mouse::ffi::{
 use crate::mouse::resolve;
 use crate::mouse::scrolling::{compute_continuous_delta, compute_delta, ScrollMode, ScrollUnit};
 use crate::{log_debug, log_info};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -208,32 +208,11 @@ fn log_button_event_diag(
     }
 }
 
-thread_local! {
-    /// 滚动归因缓存:取整光标坐标 -> 光标下窗口的 app 身份(含 None)。滚动爆发期间
-    /// 光标几乎静止,坐标不变就复用上次查询,把窗口枚举从"每个滚轮事件一次"降到
-    /// "每次坐标变化一次"。只在鼠标线程使用。
-    /// Scroll attribution cache: rounded cursor position -> app identity of the window
-    /// under it (None included). The cursor barely moves during a scroll burst; an
-    /// unchanged position reuses the last lookup, dropping window enumeration from once
-    /// per wheel event to once per position change. Mouse thread only.
-    static CURSOR_APP: RefCell<((i32, i32), Option<AppIdentity>)> = const {
-        RefCell::new(((i32::MIN, i32::MIN), None))
-    };
-}
-
-/// 光标下窗口的 app 身份(带坐标缓存)。hit-test 在 app.rs,这里只做缓存。
-/// App identity of the window under the cursor (position-cached). The hit-test lives in
-/// app.rs; this wrapper only caches.
 fn scroll_app_at_cursor(x: f64, y: f64) -> Option<AppIdentity> {
-    let key = (x.round() as i32, y.round() as i32);
-    CURSOR_APP.with(|cache| {
-        let mut slot = cache.borrow_mut();
-        if slot.0 != key {
-            slot.0 = key;
-            slot.1 = app::identity_at_point(x, y);
-        }
-        slot.1.clone()
-    })
+    if !resolve::has_per_app_scroll_profiles() {
+        return None;
+    }
+    app::identity_at_point(x, y)
 }
 
 thread_local! {
@@ -446,12 +425,10 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
     STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
 
     thread::spawn(move || unsafe {
-        // 启动时枚举一次已连接设备(惰性:归因失败时也会重枚举)。
-        // Enumerate connected devices once at startup (also lazily re-done on attribution failure).
+        let rl = CFRunLoopGetCurrent();
+        device::start_plug_monitor(rl);
         device::ensure_enumerated();
-        // 创建 event tap(HID 层,可修改/丢弃事件)。传取消标志:停止请求(缺权限重试期)提前退出。
-        // Create event tap (HID level, mutable). Pass the cancel flag: bails out early on a
-        // stop request (even during the missing-permission retry window).
+
         let tap = ffi::create_tap_with_retry(
             tap_location::HID_EVENT_TAP,
             tap_placement::HEAD_INSERT,
@@ -465,23 +442,18 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
 
         let tap = match tap {
             Some(t) => t,
-            None => return,
+            None => {
+                device::detach_plug_monitor(rl);
+                return;
+            }
         };
 
-        let rl = CFRunLoopGetCurrent();
         let source = ffi::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
         if !source.is_null() {
             ffi::CFRunLoopAddSource(rl, source, ffi::kCFRunLoopDefaultMode);
         }
         CURRENT_TAP.with(|c| c.set(tap));
         ffi::CGEventTapEnable(tap, true);
-
-        // 设备插拔监听:蓝牙断连重连时事件驱动地重建注册表(避免旧 client 缓存过期
-        // 导致归因链失效,滚动方向/档位错乱)。回调与 event tap 同线程,安全。
-        // Device plug/unplug monitor: event-driven registry rebuild on Bluetooth disconnect/
-        // reconnect (avoids the stale-client attribution failure that breaks scroll direction
-        // / profile matching). Callbacks run on this same thread, safe.
-        device::start_plug_monitor(rl);
 
         // 存入 RunLoop 供 stop() 使用;存入后再查一次停止标志,消除"存入后、run 前置位
         // 标志"的竞态窗口(stop() 读 RUNLOOP 时要么读到 Some 而 CFRunLoopStop 有效,
@@ -500,6 +472,7 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         if let Some(r) = runloop_static().lock().unwrap().take() {
             CFRelease(r as *const c_void);
         }
+        device::detach_plug_monitor(rl);
         CURRENT_TAP.with(|c| c.set(std::ptr::null_mut()));
         ffi::CGEventTapEnable(tap, false);
         if !source.is_null() {
