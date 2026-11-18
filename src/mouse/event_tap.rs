@@ -312,29 +312,31 @@ unsafe extern "C" fn mouse_event_tap_callback(
         // the previous behavior.
         let loc = CGEventGetLocation(event);
         let app_key = scroll_app_at_cursor(loc.x, loc.y).or_else(app::active_identity);
-        // 设备归因:CGEvent -> 产生事件的设备 -> (VID,PID)。失败返回 None(回退"所有鼠标"档)。
-        // Device attribution: CGEvent -> producing device -> (VID, PID). None on failure
-        // (falls back to the "All Mice" profile).
-        let dev_key = device::device_from_cgevent(event);
-        // 解析该设备 + 光标下窗口 app 的生效配置(合并全局档 + 设备档 + app 档)。
-        // Resolve the effective config for this device and the window-under-cursor app
-        // (merging global + per-device + per-app profiles).
-        let resolved = resolve::resolve(dev_key, app_key.clone());
-
-        // 归因诊断放最前,与普通滚动日志区分开,便于排查 per-device 设置不生效。
-        // Attribution diagnostics lead the line, distinguishing it from plain scroll logs so
-        // per-device settings not applying is easy to spot.
-        log_debug!(
-            "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} flags=0x{:x} reverse={}",
-            dev_key,
-            app_key,
-            loc.x,
-            loc.y,
-            dy,
-            dx,
-            flags,
-            resolved.reverse_scroll
-        );
+        let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
+        // 设备归因:仅在配置了 per-device 档或开启 debug 日志时读取 senderID 归因设备。
+        // Device attribution: query the HID sender only when per-device profiles or debug logging need it.
+        let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
+            device::device_from_cgevent(event)
+        } else {
+            None
+        };
+        let resolved = if debug_enabled {
+            let r = resolve::resolve(dev_key, app_key.clone());
+            log_debug!(
+                "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} flags=0x{:x} reverse={}",
+                dev_key,
+                app_key,
+                loc.x,
+                loc.y,
+                dy,
+                dx,
+                flags,
+                r.reverse_scroll
+            );
+            r
+        } else {
+            resolve::resolve(dev_key, app_key)
+        };
 
         // Continuous:像素级透传 + 反转,合成连续事件。Default / Line:计算 delta(透传或
         // 行数归一化 + 反转)-> post 离散事件。无论哪种都丢弃原 event。

@@ -38,13 +38,15 @@ pub struct LogConfig {
 
 // ========== 全局状态 / global state ==========
 
-static LOG_TX: OnceLock<Sender<String>> = OnceLock::new();
+static LOG_TX: OnceLock<Sender<(LogLevel, String)>> = OnceLock::new();
 static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Info as usize);
 
 // 有界通道容量:最坏约 100KB,远大于单次召唤的日志突发;仅在落盘严重卡顿时才会丢日志。
 // Bounded channel capacity: ~100KB worst case, far larger than a single summon's burst;
 // logs are dropped only when disk writes stall severely.
 const LOG_CHANNEL_CAPACITY: usize = 512;
+const DEBUG_FLUSH_DELAY: Duration = Duration::from_millis(100);
+const DEBUG_BATCH_MAX: usize = 64;
 
 // ========== 宏（调用侧接口） / macros (caller API) ==========
 
@@ -88,7 +90,7 @@ pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
         // 有界通道:满时丢弃最新日志,绝不阻塞调用线程(日志不应拖慢 UI/事件循环)。
         // Bounded channel: drop the newest entry when full; never block the caller
         // (logging must not stall the UI / event loop).
-        let _ = tx.try_send(msg);
+        let _ = tx.try_send((level, msg));
     }
 }
 
@@ -99,7 +101,7 @@ pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
 /// `is_dev`: target/ 下运行 → 同时输出 stdout;安装形态 → 只写文件 /
 /// running under target/ → also mirrors to stdout; installed form → file only.
 pub fn init(config: &LogConfig, is_dev: bool) {
-    let (tx, rx) = flume::bounded::<String>(LOG_CHANNEL_CAPACITY);
+    let (tx, rx) = flume::bounded::<(LogLevel, String)>(LOG_CHANNEL_CAPACITY);
     LOG_TX.set(tx).ok();
     LOG_LEVEL.store(config.level as usize, Ordering::Relaxed);
 
@@ -115,7 +117,27 @@ pub fn reconfigure(level: LogLevel) {
 
 // ========== 内部实现 / internals ==========
 
-fn writer_loop(rx: Receiver<String>, is_dev: bool, file_path: Option<String>) {
+fn write_log_entry(
+    is_dev: bool,
+    file: &mut Option<BufWriter<std::fs::File>>,
+    level: LogLevel,
+    msg: &str,
+    flush_now: &mut bool,
+    count: &mut usize,
+) {
+    if is_dev {
+        print!("{}", msg); // stdout,msg 已含 \n / msg already contains \n
+    }
+    if let Some(ref mut f) = file {
+        let _ = f.write_all(msg.as_bytes());
+    }
+    *count += 1;
+    if level >= LogLevel::Info {
+        *flush_now = true;
+    }
+}
+
+fn writer_loop(rx: Receiver<(LogLevel, String)>, is_dev: bool, file_path: Option<String>) {
     let mut file: Option<BufWriter<std::fs::File>> = file_path
         .and_then(|path| {
             OpenOptions::new()
@@ -130,13 +152,39 @@ fn writer_loop(rx: Receiver<String>, is_dev: bool, file_path: Option<String>) {
         })
         .map(BufWriter::new);
 
-    while let Ok(msg) = rx.recv() {
-        if is_dev {
-            print!("{}", msg); // stdout,msg 已含 \n / msg already contains \n
+    while let Ok((first_level, first_msg)) = rx.recv() {
+        let mut flush_now = false;
+        let mut count = 0usize;
+        write_log_entry(
+            is_dev,
+            &mut file,
+            first_level,
+            &first_msg,
+            &mut flush_now,
+            &mut count,
+        );
+
+        while count < DEBUG_BATCH_MAX {
+            match rx.try_recv() {
+                Ok((lvl, m)) => {
+                    write_log_entry(is_dev, &mut file, lvl, &m, &mut flush_now, &mut count)
+                }
+                Err(_) => break,
+            }
         }
+
+        // Debug 突发消息短时合并后再刷盘,降低高频事件下的系统态 flush 开销;Info 消息立即刷盘。
+        // Batch bursty Debug writes briefly before flushing while keeping Info writes immediate.
+        while !flush_now && count < DEBUG_BATCH_MAX {
+            match rx.recv_timeout(DEBUG_FLUSH_DELAY) {
+                Ok((lvl, m)) => {
+                    write_log_entry(is_dev, &mut file, lvl, &m, &mut flush_now, &mut count)
+                }
+                Err(_) => break,
+            }
+        }
+
         if let Some(ref mut f) = file {
-            let _ = f.write_all(msg.as_bytes());
-            // 每条 flush:崩溃时最多丢 1 条,文件不损坏 / flush each line: at most 1 msg lost on crash
             let _ = f.flush();
         }
     }

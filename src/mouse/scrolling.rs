@@ -173,10 +173,12 @@ mod tests {
 
     #[test]
     fn continuous_delta_does_not_use_line_count() {
-        let mut r = crate::mouse::resolve::ResolvedMouse::default();
-        r.scroll_mode = ScrollMode::Continuous;
-        r.line_count = 15;
-        r.reverse_scroll = false;
+        let mut r = crate::mouse::resolve::ResolvedMouse {
+            scroll_mode: ScrollMode::Continuous,
+            line_count: 15,
+            reverse_scroll: false,
+            ..Default::default()
+        };
         assert_eq!(compute_continuous_delta(3, 4, &r), (3, 4));
 
         r.reverse_scroll = true;

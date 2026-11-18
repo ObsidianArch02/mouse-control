@@ -18,7 +18,7 @@ use crate::mouse::device::DeviceKey;
 use crate::mouse::scrolling::ScrollMode;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// 解析后的具体生效配置(非 Option,所有字段已定)。
 /// Resolved effective config (non-Option; all fields are concrete).
@@ -64,12 +64,13 @@ impl Default for ResolvedMouse {
 type ResolveCacheKey = (Option<DeviceKey>, Option<AppIdentity>);
 
 static CACHE: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<ResolveCacheKey, ResolvedMouse>>,
+    Mutex<std::collections::HashMap<ResolveCacheKey, Arc<ResolvedMouse>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 const FLAG_COMPUTED: u8 = 1 << 0;
 const FLAG_APP_SCROLL: u8 = 1 << 1;
 const FLAG_APP_POINTER: u8 = 1 << 2;
+const FLAG_HAS_DEVICE: u8 = 1 << 3;
 
 static APP_PROFILE_FLAGS: AtomicU8 = AtomicU8::new(0);
 
@@ -90,6 +91,9 @@ fn app_profile_flags() -> u8 {
     let cfg = CONFIG.read().unwrap();
     let mut computed = FLAG_COMPUTED;
     for p in &cfg.mouse.profiles {
+        if p.device.vendor_id.is_some() || p.device.product_id.is_some() {
+            computed |= FLAG_HAS_DEVICE;
+        }
         if p.app_bundle_id.is_none() && p.app_name.is_none() {
             continue;
         }
@@ -118,6 +122,10 @@ pub(crate) fn has_per_app_scroll_profiles() -> bool {
 
 pub(crate) fn has_per_app_pointer_profiles() -> bool {
     app_profile_flags() & FLAG_APP_POINTER != 0
+}
+
+pub(crate) fn has_per_device_profiles() -> bool {
+    app_profile_flags() & FLAG_HAS_DEVICE != 0
 }
 
 /// 匹配器是否匹配给定设备。None 键 = 通配(匹配所有设备,即"所有鼠标"档)。
@@ -186,22 +194,24 @@ fn profile_specificity(profile: &MouseProfile) -> u8 {
 /// 前台 app 未知。
 /// Resolve the effective config for a device plus the current frontmost app. device = None
 /// means attribution failed; app = None means the frontmost app is unknown.
-pub(crate) fn resolve(device: Option<DeviceKey>, app: Option<AppIdentity>) -> ResolvedMouse {
+pub(crate) fn resolve(device: Option<DeviceKey>, app: Option<AppIdentity>) -> Arc<ResolvedMouse> {
     let key = (device, app);
 
     // 查缓存。
     // Check the cache.
     if let Ok(c) = CACHE.lock() {
         if let Some(r) = c.get(&key) {
-            return r.clone();
+            return Arc::clone(r);
         }
     }
 
-    let cfg = CONFIG.read().unwrap().clone();
-    let r = resolve_from(&cfg, key.0, key.1.as_ref());
+    let r = {
+        let cfg = CONFIG.read().unwrap();
+        Arc::new(resolve_from(&cfg, key.0, key.1.as_ref()))
+    };
 
     if let Ok(mut c) = CACHE.lock() {
-        c.insert(key, r.clone());
+        c.insert(key, Arc::clone(&r));
     }
     r
 }

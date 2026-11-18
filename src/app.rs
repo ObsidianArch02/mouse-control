@@ -398,9 +398,6 @@ extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, notification:
     // Release held side-button targets before the new app receives events, so modifiers from
     // the old app never stick in the new app.
     crate::mouse::buttons::release_all();
-    // 解析结果现在包含 app,旧缓存不再可靠;失效后按需重建。
-    // Resolved state now includes the app, so stale cache entries are invalid; rebuild on demand.
-    crate::mouse::resolve::invalidate_cache();
     // 指针加速可能按 app 覆盖,切 app 时重算并重应用。
     // Pointer acceleration may be overridden per app; re-evaluate and re-apply on switch.
     if crate::mouse::resolve::has_per_app_pointer_profiles() {

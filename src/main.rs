@@ -195,13 +195,6 @@ fn setup_status_bar() {
 
         let _: () = msg_send![status_item, setMenu: menu];
 
-        // 同时设为 mainMenu:让 AppKit 的 Cmd+Q keyEquivalent 分发能找到 Quit 项
-        // (accessory app 的 mainMenu 不会显示在菜单栏最左侧,但快捷键路由仍生效)。
-        // Also set as mainMenu so AppKit's Cmd+Q keyEquivalent dispatch can find the Quit item.
-        // An accessory app's mainMenu is not shown in the menu bar, but routing still works.
-        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![nsapp, setMainMenu: menu];
-
         // Pump run loop to let SystemUIServer connect
         for _ in 0..10 {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, 1u8);
