@@ -145,6 +145,7 @@ pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mu
     // Release held side-button targets before quitting so modifiers like cmd/ctrl/opt/shift
     // never stay stuck after the app exits.
     buttons::release_all();
+    buttons::flush();
     // 退出前恢复指针加速设置(否则系统鼠标保持线性,直到用户手动重置)。
     // Restore pointer acceleration settings before quitting (otherwise the mouse stays
     // linear until the user resets it manually).

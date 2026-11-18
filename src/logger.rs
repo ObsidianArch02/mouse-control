@@ -53,7 +53,9 @@ const LOG_CHANNEL_CAPACITY: usize = 512;
 #[macro_export]
 macro_rules! log_debug {
     ($($arg:tt)*) => {
-        $crate::logger::_log($crate::logger::LogLevel::Debug, format_args!($($arg)*))
+        if $crate::logger::enabled($crate::logger::LogLevel::Debug) {
+            $crate::logger::_log($crate::logger::LogLevel::Debug, format_args!($($arg)*));
+        }
     };
 }
 /// 常规运行信息(启动/开关/菜单/错误提示等),Debug 与 Info 档均输出。
@@ -61,16 +63,23 @@ macro_rules! log_debug {
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {
-        $crate::logger::_log($crate::logger::LogLevel::Info, format_args!($($arg)*))
+        if $crate::logger::enabled($crate::logger::LogLevel::Info) {
+            $crate::logger::_log($crate::logger::LogLevel::Info, format_args!($($arg)*));
+        }
     };
+}
+
+#[inline]
+pub fn enabled(level: LogLevel) -> bool {
+    let threshold =
+        unsafe { std::mem::transmute::<usize, LogLevel>(LOG_LEVEL.load(Ordering::Relaxed)) };
+    level >= threshold
 }
 
 /// 被宏调用的核心函数：阈值过滤 + 拼时间戳 + 发送到 channel。
 /// Core function called by macros: threshold filter + timestamp + send to channel.
 pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
-    let threshold =
-        unsafe { std::mem::transmute::<usize, LogLevel>(LOG_LEVEL.load(Ordering::Relaxed)) };
-    if level < threshold {
+    if !enabled(level) {
         return;
     }
     if let Some(tx) = LOG_TX.get() {

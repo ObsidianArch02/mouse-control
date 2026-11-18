@@ -152,8 +152,14 @@ extern "C" {
         port: CFMachPortRef,
         order: i64,
     ) -> CFRunLoopSourceRef;
+    pub(crate) fn CFMachPortInvalidate(port: CFMachPortRef);
 
     pub(crate) fn CFRunLoopAddSource(
+        rl: CFRunLoopRef,
+        source: CFRunLoopSourceRef,
+        mode: CFStringRef,
+    );
+    pub(crate) fn CFRunLoopRemoveSource(
         rl: CFRunLoopRef,
         source: CFRunLoopSourceRef,
         mode: CFStringRef,
@@ -164,6 +170,9 @@ extern "C" {
 
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }
+
+pub(crate) const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: CGEventType = 0xFFFF_FFFE;
+pub(crate) const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFF_FFFF;
 
 // ========== 窗口归因 FFI / window attribution FFI ==========
 // 滚动事件的 app 归因按"光标下的窗口"进行(macOS 把滚轮派发给光标下的窗口,不是
@@ -343,9 +352,6 @@ pub(crate) unsafe fn create_tap_with_retry(
         }
     }
 
-    let source = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
-    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
-    CGEventTapEnable(tap, true);
     Some(tap)
 }
 

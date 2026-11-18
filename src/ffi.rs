@@ -19,6 +19,7 @@ extern "C" {
         c_str: *const c_char,
         encoding: u32,
     ) -> *const c_void;
+    pub(crate) fn CFRetain(cf: *const c_void) -> *const c_void;
     pub(crate) fn CFRelease(cf: *const c_void);
     pub(crate) fn CFEqual(cf1: *const c_void, cf2: *const c_void) -> bool;
     pub(crate) fn CFDictionaryCreate(

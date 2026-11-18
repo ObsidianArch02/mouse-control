@@ -29,7 +29,7 @@ use crate::mouse::ffi::{
 use crate::mouse::resolve;
 use crate::mouse::scrolling::{compute_continuous_delta, compute_delta, ScrollMode, ScrollUnit};
 use crate::{log_debug, log_info};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -37,10 +37,6 @@ use std::thread;
 // ========== 鼠标事件类型常量 / mouse event type constants ==========
 // 见 CGEventType.h。
 // See CGEventType.h.
-const K_CG_EVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
-const K_CG_EVENT_LEFT_MOUSE_UP: CGEventType = 2;
-const K_CG_EVENT_RIGHT_MOUSE_DOWN: CGEventType = 3;
-const K_CG_EVENT_RIGHT_MOUSE_UP: CGEventType = 4;
 const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
 const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
 const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
@@ -147,10 +143,6 @@ unsafe fn post_continuous_scroll_event(point_dy: i64, point_dx: i64, flags: CGEv
 /// Translate an event type into a readable name for log readability.
 fn event_type_name(t: CGEventType) -> &'static str {
     match t {
-        K_CG_EVENT_LEFT_MOUSE_DOWN => "left down",
-        K_CG_EVENT_LEFT_MOUSE_UP => "left up",
-        K_CG_EVENT_RIGHT_MOUSE_DOWN => "right down",
-        K_CG_EVENT_RIGHT_MOUSE_UP => "right up",
         K_CG_EVENT_OTHER_MOUSE_DOWN => "other down",
         K_CG_EVENT_OTHER_MOUSE_UP => "other up",
         K_CG_EVENT_SCROLL_WHEEL => "scroll",
@@ -184,6 +176,9 @@ fn log_button_event_diag(
     button: i64,
     flags: CGEventFlags,
 ) {
+    if !crate::logger::enabled(crate::logger::LogLevel::Debug) {
+        return;
+    }
     unsafe {
         let io = ffi::CGEventCopyIOHIDEvent(event);
         if io.is_null() {
@@ -241,12 +236,37 @@ fn scroll_app_at_cursor(x: f64, y: f64) -> Option<AppIdentity> {
     })
 }
 
+thread_local! {
+    static CURRENT_TAP: Cell<ffi::CFMachPortRef> = const {
+        Cell::new(std::ptr::null_mut())
+    };
+}
+
 unsafe extern "C" fn mouse_event_tap_callback(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
+    if event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+        || event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+    {
+        if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            let tap = CURRENT_TAP.with(|c| c.get());
+            if !tap.is_null() {
+                ffi::CGEventTapEnable(tap, true);
+                log_info!(
+                    "[mouse] event tap disabled by system (type=0x{:x}); re-enabled.",
+                    event_type
+                );
+            }
+        }
+        return event;
+    }
+    if event.is_null() {
+        return event;
+    }
+
     let flags: CGEventFlags = CGEventGetFlags(event);
 
     if event_type == K_CG_EVENT_SCROLL_WHEEL {
@@ -405,11 +425,12 @@ pub(crate) fn stop() {
     // 先置位标志再停 RunLoop:重试窗口内线程醒来即可见(不依赖 RunLoop)。
     // Set the flag first, then stop the RunLoop: during the retry window the thread sees the
     // flag on wake-up (no RunLoop involved yet).
-    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
     let rl = runloop_static().lock().unwrap().take();
     if let Some(rl) = rl {
         unsafe {
             ffi::CFRunLoopStop(rl);
+            CFRelease(rl as *const c_void);
         }
     }
 }
@@ -418,21 +439,13 @@ pub(crate) fn stop() {
 /// Start the mouse event listener thread. Called by main.rs / the menu when mouse control
 /// is enabled.
 pub(crate) fn start() -> thread::JoinHandle<()> {
-    // 监听掩码:左/右/其他按键 down/up + 滚轮。暂不含 mouseMoved(日志会爆炸)。
-    // Listen mask: left/right/other button down/up + scroll wheel. Excludes mouseMoved.
-    let mask: CGEventMask = (1u64 << K_CG_EVENT_LEFT_MOUSE_DOWN)
-        | (1u64 << K_CG_EVENT_LEFT_MOUSE_UP)
-        | (1u64 << K_CG_EVENT_RIGHT_MOUSE_DOWN)
-        | (1u64 << K_CG_EVENT_RIGHT_MOUSE_UP)
-        | (1u64 << K_CG_EVENT_OTHER_MOUSE_DOWN)
+    let mask: CGEventMask = (1u64 << K_CG_EVENT_OTHER_MOUSE_DOWN)
         | (1u64 << K_CG_EVENT_OTHER_MOUSE_UP)
         | (1u64 << K_CG_EVENT_SCROLL_WHEEL);
 
-    thread::spawn(move || unsafe {
-        // 新线程首件事:清掉上次运行可能残留的停止标志。
-        // First thing in the new thread: clear any stale stop flag from a previous run.
-        STOP_REQUESTED.store(false, std::sync::atomic::Ordering::Relaxed);
+    STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
 
+    thread::spawn(move || unsafe {
         // 启动时枚举一次已连接设备(惰性:归因失败时也会重枚举)。
         // Enumerate connected devices once at startup (also lazily re-done on attribution failure).
         device::ensure_enumerated();
@@ -457,7 +470,10 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
 
         let rl = CFRunLoopGetCurrent();
         let source = ffi::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
-        ffi::CFRunLoopAddSource(rl, source, ffi::kCFRunLoopDefaultMode);
+        if !source.is_null() {
+            ffi::CFRunLoopAddSource(rl, source, ffi::kCFRunLoopDefaultMode);
+        }
+        CURRENT_TAP.with(|c| c.set(tap));
         ffi::CGEventTapEnable(tap, true);
 
         // 设备插拔监听:蓝牙断连重连时事件驱动地重建注册表(避免旧 client 缓存过期
@@ -473,13 +489,24 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         // Store the RunLoop for stop(); re-check the stop flag after storing to close the race
         // where the flag is set between the store and the run (stop() either reads Some and
         // CFRunLoopStop works, or reads None and the thread's check catches it).
+        crate::ffi::CFRetain(rl as *const c_void);
         *runloop_static().lock().unwrap() = Some(rl);
-        if !STOP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+        if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             log_info!("Mouse event tap started.");
             // 阻塞运行 RunLoop,直到 stop() 触发 CFRunLoopStop 或线程被终止。
             // Block on the RunLoop until stop() fires CFRunLoopStop or the thread is killed.
             ffi::CFRunLoopRun();
         }
-        *runloop_static().lock().unwrap() = None;
+        if let Some(r) = runloop_static().lock().unwrap().take() {
+            CFRelease(r as *const c_void);
+        }
+        CURRENT_TAP.with(|c| c.set(std::ptr::null_mut()));
+        ffi::CGEventTapEnable(tap, false);
+        if !source.is_null() {
+            ffi::CFRunLoopRemoveSource(rl, source, ffi::kCFRunLoopDefaultMode);
+            CFRelease(source as *const c_void);
+        }
+        ffi::CFMachPortInvalidate(tap);
+        CFRelease(tap as *const c_void);
     })
 }

@@ -400,10 +400,9 @@ pub(crate) fn handle_down(button: u32, key: &PressedKey) {
     // Modifiers already held by other side buttons are not pressed again (avoids stuck
     // duplicate ctrl downs).
     let held_elsewhere = held.values().fold(0, |acc, k| acc | k.modifiers);
-    unsafe {
-        post_key_event(key, true, held_elsewhere);
-    }
     held.insert(button, *key);
+    drop(held);
+    enqueue_step(*key, true, held_elsewhere);
     log_debug!("[buttons] button {} down -> {:?}", button, key.action);
 }
 
@@ -422,9 +421,8 @@ pub(crate) fn handle_up(button: u32) {
     // 若还有其他侧键在用同一修饰键,不释放它。
     // Don't release a modifier still needed by other held side buttons.
     let held_elsewhere = held.values().fold(0, |acc, k| acc | k.modifiers);
-    unsafe {
-        post_key_event(&key, false, held_elsewhere);
-    }
+    drop(held);
+    enqueue_step(key, false, held_elsewhere);
     log_debug!("[buttons] button {} up -> {:?}", button, key.action);
 }
 
@@ -442,29 +440,109 @@ pub(crate) fn release_all() {
     // Release only the main keys in the loop; release each used modifier once at the end
     // to avoid duplicate keyups.
     let mods_used = held.values().fold(0, |acc, k| acc | k.modifiers);
-    for key in held.values() {
-        unsafe {
-            post_key_event(key, false, mods_used);
-        }
-    }
-    let mut remaining = mods_used;
-    for (flag, vk) in MODIFIER_KEYCODES {
-        if mods_used & flag != 0 {
-            unsafe {
-                post_modifier_key(vk, flag, false, remaining);
-            }
-            remaining &= !flag;
-        }
-    }
+    let keys: Vec<PressedKey> = held.values().copied().collect();
     let n = held.len();
     held.clear();
+    drop(held);
+    enqueue_release_all(keys, mods_used);
     log_debug!("[buttons] released {} held button(s)", n);
 }
+
+#[cfg(not(test))]
+enum KeyJob {
+    Step {
+        key: PressedKey,
+        down: bool,
+        held_elsewhere: CGEventFlags,
+    },
+    ReleaseAll {
+        keys: Vec<PressedKey>,
+        mods_used: CGEventFlags,
+    },
+    Flush(flume::Sender<()>),
+}
+
+#[cfg(not(test))]
+static KEY_TX: std::sync::OnceLock<flume::Sender<KeyJob>> = std::sync::OnceLock::new();
+
+#[cfg(not(test))]
+fn key_sender() -> &'static flume::Sender<KeyJob> {
+    KEY_TX.get_or_init(|| {
+        let (tx, rx) = flume::unbounded::<KeyJob>();
+        std::thread::Builder::new()
+            .name("button-keys".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    objc2::rc::autoreleasepool(|_| unsafe {
+                        match job {
+                            KeyJob::Step {
+                                key,
+                                down,
+                                held_elsewhere,
+                            } => post_key_event(&key, down, held_elsewhere),
+                            KeyJob::ReleaseAll { keys, mods_used } => {
+                                for key in &keys {
+                                    post_key_event(key, false, mods_used);
+                                }
+                                let mut remaining = mods_used;
+                                for (flag, vk) in MODIFIER_KEYCODES {
+                                    if mods_used & flag != 0 {
+                                        post_modifier_key(vk, flag, false, remaining);
+                                        remaining &= !flag;
+                                    }
+                                }
+                            }
+                            KeyJob::Flush(ack) => {
+                                let _ = ack.send(());
+                            }
+                        }
+                    });
+                }
+            })
+            .expect("failed to spawn button keys worker thread");
+        tx
+    })
+}
+
+#[cfg(not(test))]
+fn enqueue_step(key: PressedKey, down: bool, held_elsewhere: CGEventFlags) {
+    let _ = key_sender().send(KeyJob::Step {
+        key,
+        down,
+        held_elsewhere,
+    });
+}
+
+#[cfg(not(test))]
+fn enqueue_release_all(keys: Vec<PressedKey>, mods_used: CGEventFlags) {
+    let _ = key_sender().send(KeyJob::ReleaseAll { keys, mods_used });
+}
+
+#[cfg(not(test))]
+pub(crate) fn flush() {
+    if let Some(tx) = KEY_TX.get() {
+        let (ack_tx, ack_rx) = flume::bounded(1);
+        if tx.send(KeyJob::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv_timeout(std::time::Duration::from_millis(250));
+        }
+    }
+}
+
+#[cfg(test)]
+fn enqueue_step(_key: PressedKey, _down: bool, _held_elsewhere: CGEventFlags) {}
+
+#[cfg(test)]
+fn enqueue_release_all(_keys: Vec<PressedKey>, _mods_used: CGEventFlags) {}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn flush() {}
 
 // ========== 事件合成 / event synthesis ==========
 
 /// 修饰键 flag -> 虚拟键码(用于先按下/后释放真实修饰键)。
 /// Modifier flag -> virtual keycode (used to press/release real modifier keys).
+#[cfg(not(test))]
 const MODIFIER_KEYCODES: [(CGEventFlags, u16); 4] = [
     (K_CG_EVENT_FLAG_MASK_COMMAND, K_VK_COMMAND),
     (K_CG_EVENT_FLAG_MASK_CONTROL, K_VK_CONTROL),
@@ -553,6 +631,7 @@ unsafe fn post_simple_key(keycode: u16, down: bool, flags: CGEventFlags) {
     let inherited = CGEventGetFlags(ev) & !MODIFIER_FLAG_MASK;
     CGEventSetFlags(ev, inherited | flags);
     CGEventPost(K_CG_HID_EVENT_TAP, ev);
+    crate::ffi::CFRelease(ev as *const std::ffi::c_void);
 }
 
 /// 四个通用修饰位:合成事件里只由动作串决定,不从继承 flags 带入。
@@ -572,14 +651,6 @@ unsafe fn post_modifier_key(vk: u16, flag: CGEventFlags, down: bool, held: CGEve
     let flags = if down { held | flag } else { held & !flag };
     post_simple_key(vk, down, flags);
 }
-
-/// 测试环境:不真的往系统投递键盘事件,状态机测试只验证 held 记录。
-/// Test builds: never post real events; state-machine tests only verify the held map.
-#[cfg(test)]
-unsafe fn post_key_event(_key: &PressedKey, _down: bool, _held_elsewhere: CGEventFlags) {}
-
-#[cfg(test)]
-unsafe fn post_modifier_key(_vk: u16, _flag: CGEventFlags, _down: bool, _held: CGEventFlags) {}
 
 /// 事件 flags:组合修饰键 + 主键本身是修饰键时补上自身 flag(与真实按键事件一致)。
 /// Event flags: combined modifiers + the main key's own flag when it is a modifier
