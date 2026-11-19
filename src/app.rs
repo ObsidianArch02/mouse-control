@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 const ACTIVATION_POLICY_PROHIBITED: isize = 2;
 const PID_MAP_MAX: usize = 512;
 const MAX_WINDOW_LAYER: i32 = 20;
-const WINDOW_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+const WINDOW_SNAPSHOT_TTL: Duration = Duration::from_millis(3000);
 const POST_SWITCH_SETTLE_FIRST: Duration = Duration::from_millis(150);
 const POST_SWITCH_SETTLE_SECOND: Duration = Duration::from_millis(400);
 
@@ -59,11 +59,13 @@ struct WindowRect {
     x1: f64,
     y1: f64,
     identity: AppIdentity,
+    scroll: crate::mouse::resolve::ResolvedScroll,
 }
 
 struct WindowSnapshot {
     windows: Vec<WindowRect>,
     epoch: u64,
+    config_gen: u64,
     updated_at: Option<Instant>,
 }
 
@@ -118,6 +120,11 @@ impl SnapSignalState {
 }
 
 static ACTIVE_APP: Mutex<Option<AppIdentity>> = Mutex::new(None);
+static ACTIVE_SCROLL: std::sync::LazyLock<Mutex<crate::mouse::resolve::ResolvedScroll>> =
+    std::sync::LazyLock::new(|| {
+        let app = ACTIVE_APP.lock().unwrap().clone();
+        Mutex::new(crate::mouse::resolve::resolve_scroll_for_app(app.as_ref()))
+    });
 static PID_MAP: std::sync::LazyLock<Mutex<HashMap<i32, CachedApp>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static APP_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -126,6 +133,7 @@ static WINDOW_SNAPSHOT: std::sync::LazyLock<Mutex<WindowSnapshot>> =
         Mutex::new(WindowSnapshot {
             windows: Vec::new(),
             epoch: 0,
+            config_gen: 0,
             updated_at: None,
         })
     });
@@ -140,7 +148,25 @@ pub(crate) fn active_identity() -> Option<AppIdentity> {
     ACTIVE_APP.lock().unwrap().clone()
 }
 
+/// 返回当前前台 app 预解析好的滚轮参数(Copy,零堆分配)。
+/// Return the pre-resolved scroll config for the active app (Copy, zero heap allocation).
+pub(crate) fn active_scroll() -> crate::mouse::resolve::ResolvedScroll {
+    *ACTIVE_SCROLL.lock().unwrap()
+}
+
+/// 配置重载时同步刷新前台 app 与窗口快照的预解析滚轮参数。
+/// Refresh pre-resolved scroll parameters after a config reload.
+pub(crate) fn refresh_scroll_cache() {
+    let active = ACTIVE_APP.lock().unwrap().clone();
+    *ACTIVE_SCROLL.lock().unwrap() = crate::mouse::resolve::resolve_scroll_for_app(active.as_ref());
+    if SNAP_WORKER.get().is_some() {
+        request_snapshot_refresh();
+    }
+}
+
 fn set_active(identity: AppIdentity) -> bool {
+    let resolved = crate::mouse::resolve::resolve_scroll_for_app(Some(&identity));
+    *ACTIVE_SCROLL.lock().unwrap() = resolved;
     let mut guard = ACTIVE_APP.lock().unwrap();
     let changed = guard.as_ref() != Some(&identity);
     *guard = Some(identity);
@@ -273,6 +299,28 @@ fn lookup_window_identity(
     (hit, needs_refresh)
 }
 
+fn lookup_window_scroll(
+    snap: &WindowSnapshot,
+    current_epoch: u64,
+    current_cfg_gen: u64,
+    x: f64,
+    y: f64,
+    now: Instant,
+) -> (Option<crate::mouse::resolve::ResolvedScroll>, bool) {
+    if snap.epoch != current_epoch || snap.config_gen != current_cfg_gen {
+        return (None, true);
+    }
+    let hit = snap
+        .windows
+        .iter()
+        .find(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
+        .map(|r| r.scroll);
+    let needs_refresh = snap
+        .updated_at
+        .is_none_or(|t| now.saturating_duration_since(t) >= WINDOW_SNAPSHOT_TTL);
+    (hit, needs_refresh)
+}
+
 unsafe fn lookup_or_query_pid(pid: i32) -> Option<CachedApp> {
     if pid <= 0 {
         return None;
@@ -352,12 +400,14 @@ unsafe fn capture_window_rects() -> Vec<WindowRect> {
             continue;
         }
         if let Some(cached) = cached {
+            let scroll = crate::mouse::resolve::resolve_scroll_for_app(Some(&cached.identity));
             windows.push(WindowRect {
                 x0: rect.origin.x,
                 y0: rect.origin.y,
                 x1: rect.origin.x + rect.size.width,
                 y1: rect.origin.y + rect.size.height,
                 identity: cached.identity,
+                scroll,
             });
         }
     }
@@ -387,14 +437,18 @@ fn ensure_snap_worker() {
 
                 loop {
                     let target_epoch = APP_EPOCH.load(Ordering::Acquire);
+                    let target_cfg_gen = crate::mouse::resolve::config_generation();
                     let windows = autoreleasepool(|_| unsafe { capture_window_rects() });
                     {
                         let mut snap = WINDOW_SNAPSHOT.lock().unwrap();
                         snap.windows = windows;
                         snap.epoch = target_epoch;
+                        snap.config_gen = target_cfg_gen;
                         snap.updated_at = Some(Instant::now());
                     }
-                    if APP_EPOCH.load(Ordering::Acquire) == target_epoch {
+                    if APP_EPOCH.load(Ordering::Acquire) == target_epoch
+                        && crate::mouse::resolve::config_generation() == target_cfg_gen
+                    {
                         break;
                     }
                 }
@@ -434,6 +488,23 @@ pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
         request_snapshot_refresh();
     }
     hit
+}
+
+/// 零堆分配滚轮热路径:直接从内存窗口快照复制预解析好的 ResolvedScroll,未命中或代际滞后时
+/// 立即回退到前台 app 的预解析参数。
+/// Zero-allocation scroll hot path: copies the pre-resolved ResolvedScroll directly from the
+/// in-memory window snapshot, falling back to the active app's pre-resolved config on miss.
+pub(crate) fn scroll_at_point_or_active(x: f64, y: f64) -> crate::mouse::resolve::ResolvedScroll {
+    let current_epoch = APP_EPOCH.load(Ordering::Acquire);
+    let current_cfg_gen = crate::mouse::resolve::config_generation();
+    let (hit, needs_refresh) = {
+        let snap = WINDOW_SNAPSHOT.lock().unwrap();
+        lookup_window_scroll(&snap, current_epoch, current_cfg_gen, x, y, Instant::now())
+    };
+    if needs_refresh {
+        request_snapshot_refresh();
+    }
+    hit.unwrap_or_else(active_scroll)
 }
 
 unsafe fn seed_pid_map() {
@@ -738,6 +809,16 @@ mod tests {
             bundle_id: Some("net.imput.helium".to_string()),
             localized_name: Some("Helium".to_string()),
         };
+        let front_scroll = crate::mouse::resolve::ResolvedScroll {
+            scroll_mode: crate::mouse::scrolling::ScrollMode::Pixel,
+            line_count: 1,
+            ..Default::default()
+        };
+        let back_scroll = crate::mouse::resolve::ResolvedScroll {
+            scroll_mode: crate::mouse::scrolling::ScrollMode::Pixel,
+            line_count: 3,
+            ..Default::default()
+        };
         let snap = WindowSnapshot {
             windows: vec![
                 WindowRect {
@@ -746,6 +827,7 @@ mod tests {
                     x1: 500.0,
                     y1: 500.0,
                     identity: front.clone(),
+                    scroll: front_scroll,
                 },
                 WindowRect {
                     x0: 0.0,
@@ -753,9 +835,11 @@ mod tests {
                     x1: 1000.0,
                     y1: 1000.0,
                     identity: back.clone(),
+                    scroll: back_scroll,
                 },
             ],
             epoch: 3,
+            config_gen: 7,
             updated_at: Some(now),
         };
 
@@ -778,6 +862,19 @@ mod tests {
         assert_eq!(
             lookup_window_identity(&snap, 3, 50.0, 50.0, now + WINDOW_SNAPSHOT_TTL),
             (Some(back), true)
+        );
+
+        assert_eq!(
+            lookup_window_scroll(&snap, 3, 8, 200.0, 200.0, now),
+            (None, true)
+        );
+        assert_eq!(
+            lookup_window_scroll(&snap, 3, 7, 200.0, 200.0, now),
+            (Some(front_scroll), false)
+        );
+        assert_eq!(
+            lookup_window_scroll(&snap, 3, 7, 50.0, 50.0, now + WINDOW_SNAPSHOT_TTL),
+            (Some(back_scroll), true)
         );
     }
 

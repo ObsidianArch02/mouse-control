@@ -17,8 +17,29 @@ use crate::mouse::buttons::{self, PressedKey};
 use crate::mouse::device::DeviceKey;
 use crate::mouse::scrolling::ScrollMode;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// 滚轮热路径所需的轻量 Copy 参数快照(无 String、无 Arc、无堆分配)。
+/// Compact Copy scroll parameters for the zero-allocation event-tap hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedScroll {
+    pub reverse_scroll: bool,
+    pub scroll_mode: ScrollMode,
+    pub line_count: u32,
+    pub line_height: Option<u32>,
+}
+
+impl Default for ResolvedScroll {
+    fn default() -> Self {
+        Self {
+            reverse_scroll: true,
+            scroll_mode: ScrollMode::Line,
+            line_count: 3,
+            line_height: None,
+        }
+    }
+}
 
 /// 解析后的具体生效配置(非 Option,所有字段已定)。
 /// Resolved effective config (non-Option; all fields are concrete).
@@ -39,6 +60,17 @@ pub(crate) struct ResolvedMouse {
     /// Side-button number (3/4) -> parsed action. A hit replaces the original side-button
     /// event; a miss passes the event through untouched.
     pub button_map: BTreeMap<u32, PressedKey>,
+}
+
+impl ResolvedMouse {
+    pub(crate) fn scroll(&self) -> ResolvedScroll {
+        ResolvedScroll {
+            reverse_scroll: self.reverse_scroll,
+            scroll_mode: self.scroll_mode,
+            line_count: self.line_count,
+            line_height: self.line_height,
+        }
+    }
 }
 
 impl Default for ResolvedMouse {
@@ -73,14 +105,28 @@ const FLAG_APP_SCROLL: u8 = 1 << 1;
 const FLAG_HAS_DEVICE: u8 = 1 << 2;
 
 static APP_PROFILE_FLAGS: AtomicU8 = AtomicU8::new(0);
+static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn config_generation() -> u64 {
+    CONFIG_GENERATION.load(Ordering::Acquire)
+}
+
+/// 仅按 app 解析滚动参数(供后台 window-snap 与前台 app 缓存预计算,不在 tap 热路径调)。
+/// Resolve scroll parameters for an app (used off-hot-path by window-snap and active-app cache).
+pub(crate) fn resolve_scroll_for_app(app: Option<&AppIdentity>) -> ResolvedScroll {
+    let cfg = CONFIG.read().unwrap();
+    resolve_from(&cfg, None, app).scroll()
+}
 
 /// 使缓存失效(配置重载或设备变更时调用)。
 /// Invalidate the cache (called on config reload or device changes).
 pub(crate) fn invalidate_cache() {
     APP_PROFILE_FLAGS.store(0, Ordering::Release);
+    CONFIG_GENERATION.fetch_add(1, Ordering::Release);
     if let Ok(mut c) = CACHE.lock() {
         c.clear();
     }
+    crate::app::refresh_scroll_cache();
 }
 
 fn app_profile_flags() -> u8 {

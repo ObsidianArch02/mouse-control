@@ -101,7 +101,7 @@ impl ScrollMode {
 pub(crate) fn compute_delta(
     dy: i64,
     dx: i64,
-    r: &crate::mouse::resolve::ResolvedMouse,
+    r: crate::mouse::resolve::ResolvedScroll,
 ) -> (i32, i32, ScrollUnit) {
     let mode = r.scroll_mode;
     let flip = should_flip(r.reverse_scroll);
@@ -157,7 +157,7 @@ pub(crate) fn compute_delta(
                 }
             }
         }
-        // 连续模式由 event_tap 单独读取 point delta 后合成,这里保留透传兜底。
+        // 连续模式由 event_tap 单独读取 point delta 后原地修改,这里保留透传兜底。
         // Continuous mode reads point deltas separately in event_tap; keep passthrough here.
         ScrollMode::Continuous => (dy as i32, dx as i32, ScrollUnit::Line),
     };
@@ -175,7 +175,7 @@ pub(crate) fn compute_delta(
 pub(crate) fn compute_continuous_delta(
     point_dy: i64,
     point_dx: i64,
-    r: &crate::mouse::resolve::ResolvedMouse,
+    r: crate::mouse::resolve::ResolvedScroll,
 ) -> (i64, i64) {
     let flip = should_flip(r.reverse_scroll);
     let (mut ndy, mut ndx) = (point_dy, point_dx);
@@ -214,86 +214,82 @@ mod tests {
 
     #[test]
     fn continuous_delta_does_not_use_line_count() {
-        let mut r = crate::mouse::resolve::ResolvedMouse {
+        let mut r = crate::mouse::resolve::ResolvedScroll {
             scroll_mode: ScrollMode::Continuous,
             line_count: 15,
             reverse_scroll: false,
             ..Default::default()
         };
-        assert_eq!(compute_continuous_delta(3, 4, &r), (3, 4));
+        assert_eq!(compute_continuous_delta(3, 4, r), (3, 4));
 
         r.reverse_scroll = true;
-        assert_eq!(compute_continuous_delta(3, 4, &r), (-3, -4));
+        assert_eq!(compute_continuous_delta(3, 4, r), (-3, -4));
     }
 
     #[test]
     fn line_mode_without_line_height_keeps_line_units() {
-        let r = |reverse: bool| crate::mouse::resolve::ResolvedMouse {
+        let r = |reverse: bool| crate::mouse::resolve::ResolvedScroll {
             scroll_mode: ScrollMode::Line,
             line_count: 3,
             reverse_scroll: reverse,
             ..Default::default()
         };
-        assert_eq!(compute_delta(1, 0, &r(false)), (3, 0, ScrollUnit::Line));
+        assert_eq!(compute_delta(1, 0, r(false)), (3, 0, ScrollUnit::Line));
         // 反转开关继续生效。
         // The reverse toggle still applies.
-        assert_eq!(compute_delta(1, 0, &r(true)), (-3, 0, ScrollUnit::Line));
+        assert_eq!(compute_delta(1, 0, r(true)), (-3, 0, ScrollUnit::Line));
     }
 
     #[test]
     fn line_mode_with_line_height_uses_pixel_units() {
-        let r = |reverse: bool| crate::mouse::resolve::ResolvedMouse {
+        let r = |reverse: bool| crate::mouse::resolve::ResolvedScroll {
             scroll_mode: ScrollMode::Line,
             line_count: 2,
             line_height: Some(24),
             reverse_scroll: reverse,
-            ..Default::default()
         };
         // delta = line_count x line_height,方向跟随原事件。
         // delta = line_count x line_height, direction follows the original event.
-        assert_eq!(compute_delta(1, 0, &r(false)), (48, 0, ScrollUnit::Pixel));
-        assert_eq!(compute_delta(-1, 0, &r(false)), (-48, 0, ScrollUnit::Pixel));
-        assert_eq!(compute_delta(0, 1, &r(false)), (0, 48, ScrollUnit::Pixel));
+        assert_eq!(compute_delta(1, 0, r(false)), (48, 0, ScrollUnit::Pixel));
+        assert_eq!(compute_delta(-1, 0, r(false)), (-48, 0, ScrollUnit::Pixel));
+        assert_eq!(compute_delta(0, 1, r(false)), (0, 48, ScrollUnit::Pixel));
 
         // 反转开关继续生效。
         // The reverse toggle still applies.
-        assert_eq!(compute_delta(1, 0, &r(true)), (-48, 0, ScrollUnit::Pixel));
+        assert_eq!(compute_delta(1, 0, r(true)), (-48, 0, ScrollUnit::Pixel));
     }
 
     #[test]
     fn pixel_mode_uses_default_or_custom_line_height() {
-        let default_h = crate::mouse::resolve::ResolvedMouse {
+        let default_h = crate::mouse::resolve::ResolvedScroll {
             scroll_mode: ScrollMode::Pixel,
             line_count: 1,
             line_height: None,
             reverse_scroll: false,
-            ..Default::default()
         };
         assert_eq!(
-            compute_delta(5, 0, &default_h),
+            compute_delta(5, 0, default_h),
             (DEFAULT_LINE_HEIGHT as i32, 0, ScrollUnit::Pixel)
         );
 
-        let custom_h = crate::mouse::resolve::ResolvedMouse {
+        let custom_h = crate::mouse::resolve::ResolvedScroll {
             scroll_mode: ScrollMode::Pixel,
             line_count: 2,
             line_height: Some(24),
             reverse_scroll: true,
-            ..Default::default()
         };
-        assert_eq!(compute_delta(1, 0, &custom_h), (-48, 0, ScrollUnit::Pixel));
+        assert_eq!(compute_delta(1, 0, custom_h), (-48, 0, ScrollUnit::Pixel));
     }
 
     #[test]
     fn discrete_mode_ignores_inherited_line_height() {
-        let r = crate::mouse::resolve::ResolvedMouse {
+        let r = crate::mouse::resolve::ResolvedScroll {
             scroll_mode: ScrollMode::Discrete,
             line_count: 3,
             line_height: Some(24),
             reverse_scroll: true,
-            ..Default::default()
         };
-        assert_eq!(compute_delta(7, 0, &r), (-3, 0, ScrollUnit::Line));
-        assert_eq!(compute_delta(-2, 0, &r), (3, 0, ScrollUnit::Line));
+        assert_eq!(compute_delta(7, 0, r), (-3, 0, ScrollUnit::Line));
+        assert_eq!(compute_delta(-2, 0, r), (3, 0, ScrollUnit::Line));
     }
 }

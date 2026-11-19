@@ -16,16 +16,14 @@ use crate::ffi::CFRelease;
 use crate::mouse::buttons;
 use crate::mouse::device;
 use crate::mouse::ffi::{
-    self, is_synthetic_scroll_marker, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent,
-    CGEventCreate, CGEventCreateScrollWheelEvent2, CGEventFlags, CGEventGetFlags,
-    CGEventGetIntegerValueField, CGEventGetLocation, CGEventMask, CGEventPost, CGEventRef,
-    CGEventSetFlags, CGEventSetIntegerValueField, CGEventSetLocation, CGEventTapProxy, CGEventType,
-    CGPointFFI, K_CG_EVENT_SOURCE_USER_DATA, K_CG_EVENT_TYPE, K_CG_SCROLL_EVENT_UNIT_LINE,
-    K_CG_SCROLL_EVENT_UNIT_PIXEL, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
-    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
-    K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
-    K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
-    K_CG_SESSION_EVENT_TAP, MOS_SYNTHETIC_MARKER,
+    self, is_synthetic_scroll_marker, tap_location, tap_options, tap_placement,
+    CFRunLoopGetCurrent, CGEventFlags, CGEventGetFlags, CGEventGetIntegerValueField,
+    CGEventGetLocation, CGEventMask, CGEventRef, CGEventSetDoubleValueField,
+    CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, K_CG_EVENT_SOURCE_USER_DATA,
+    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
+    K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
+    K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+    K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, MOS_SYNTHETIC_MARKER,
 };
 use crate::mouse::resolve;
 use crate::mouse::scrolling::{compute_continuous_delta, compute_delta, ScrollMode, ScrollUnit};
@@ -48,48 +46,12 @@ const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 // per-event-type sequence counter, not the button number).
 const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
 
-/// 合成一个滚轮事件并 post 到 session 层。
-/// 单位由 ScrollUnit 决定:行单位(缺省/默认模式)或像素单位(line_height 模式);
-/// 默认模式透传原 delta。
+/// 把像素级滚动量转换成连续/像素滚动事件所需的整数 line 分量。
+/// 1 line = 10 pixels;不足 1 line 的非零滚动至少向上取整到 +/-1,与 CGEventCreateScrollWheelEvent2 一致。
 ///
-/// Synthesize a scroll event and post it to the session level.
-/// The unit comes from ScrollUnit: lines (absent line_height / default mode) or pixels
-/// (the line_height mode); Default mode passes the raw delta through.
-unsafe fn post_scroll_event(
-    dy: i32,
-    dx: i32,
-    units: ScrollUnit,
-    flags: CGEventFlags,
-    loc: CGPointFFI,
-) {
-    if dy == 0 && dx == 0 {
-        return;
-    }
-    let unit = match units {
-        ScrollUnit::Line => K_CG_SCROLL_EVENT_UNIT_LINE,
-        ScrollUnit::Pixel => K_CG_SCROLL_EVENT_UNIT_PIXEL,
-    };
-    let synthetic = CGEventCreateScrollWheelEvent2(std::ptr::null(), unit, 2, dy, dx, 0);
-
-    if synthetic.is_null() {
-        log_info!("[mouse] failed to synthesize scroll event");
-        return;
-    }
-
-    CGEventSetLocation(synthetic, loc);
-    CGEventSetFlags(synthetic, flags);
-    CGEventSetIntegerValueField(synthetic, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
-
-    CGEventPost(K_CG_SESSION_EVENT_TAP, synthetic);
-    CFRelease(synthetic as *const c_void);
-}
-
-/// 把像素级滚动量转换成连续滚动事件所需的 line/fixed-point 分量。
-/// 1 line = 10 pixels;不足 1 line 的非零滚动至少向上取整到 +/-1,模仿 trackpad 事件。
-///
-/// Convert a pixel delta into the line/fixed-point components required by a continuous scroll
-/// event. 1 line = 10 pixels; a non-zero delta smaller than one line is rounded away from zero
-/// to at least +/-1, mimicking real trackpad events.
+/// Convert a pixel delta into the integer line component required by pixel/continuous scroll
+/// events. 1 line = 10 pixels; a non-zero delta smaller than one line rounds away from zero
+/// to +/-1, matching CGEventCreateScrollWheelEvent2.
 fn line_delta_from_point(point: i64) -> i64 {
     let line = point / 10;
     if point != 0 && line == 0 {
@@ -99,64 +61,67 @@ fn line_delta_from_point(point: i64) -> i64 {
     }
 }
 
-/// 合成一个连续(触控板式)滚轮事件并 post 到 session 层。
-/// 与 Mac Mouse Fix 的 ContinuousScroll 输出一致:显式设置 type=22、continuous=1,
-/// 同时写入 line / point / fixed-point delta。
+/// 原地改写滚轮 CGEvent 为精准像素事件(isContinuous=1, hasPreciseScrollingDeltas=true),
+/// 不创建新事件、不调用 CGEventPost,零 Mach IPC 往返。
+/// 注意字段写入顺序:先写 DeltaAxis 再写 PointDelta 与 FixedPtDelta(写 DeltaAxis 会重置后两者)。
 ///
-/// Synthesize a continuous (trackpad-style) scroll event and post it to the session level.
-/// Matches Mac Mouse Fix's ContinuousScroll output: explicitly set type=22, continuous=1,
-/// and write line / point / fixed-point deltas together.
-unsafe fn post_continuous_scroll_event(
-    point_dy: i64,
-    point_dx: i64,
-    flags: CGEventFlags,
-    loc: CGPointFFI,
-) {
-    if point_dy == 0 && point_dx == 0 {
-        return;
-    }
-    let synthetic = CGEventCreate(std::ptr::null());
-    if synthetic.is_null() {
-        log_info!("[mouse] failed to synthesize continuous scroll event");
-        return;
-    }
-
+/// Mutate a scroll CGEvent in place into a precise pixel event (isContinuous=1,
+/// hasPreciseScrollingDeltas=true) with zero CGEventPost Mach IPC.
+/// Field order matters: set DeltaAxis before PointDelta and FixedPtDelta.
+unsafe fn mutate_scroll_pixel_in_place(event: CGEventRef, point_dy: i64, point_dx: i64) {
     let line_dy = line_delta_from_point(point_dy);
     let line_dx = line_delta_from_point(point_dx);
-
-    CGEventSetIntegerValueField(synthetic, K_CG_EVENT_TYPE, K_CG_EVENT_SCROLL_WHEEL as i64);
-    CGEventSetIntegerValueField(synthetic, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
-
-    CGEventSetIntegerValueField(synthetic, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, line_dy);
-    CGEventSetIntegerValueField(
-        synthetic,
-        K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
-        point_dy,
-    );
-    CGEventSetIntegerValueField(
-        synthetic,
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, line_dy);
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, line_dx);
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, point_dy);
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, point_dx);
+    CGEventSetDoubleValueField(
+        event,
         K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
-        line_dy * 65_536,
+        point_dy as f64 / 10.0,
     );
-
-    CGEventSetIntegerValueField(synthetic, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, line_dx);
-    CGEventSetIntegerValueField(
-        synthetic,
-        K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
-        point_dx,
-    );
-    CGEventSetIntegerValueField(
-        synthetic,
+    CGEventSetDoubleValueField(
+        event,
         K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
-        line_dx * 65_536,
+        point_dx as f64 / 10.0,
     );
+    CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
+}
 
-    CGEventSetLocation(synthetic, loc);
-    CGEventSetFlags(synthetic, flags);
-    CGEventSetIntegerValueField(synthetic, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
+/// 原地改写滚轮 CGEvent 为离散行事件(isContinuous=0, hasPreciseScrollingDeltas=false),
+/// 零 CGEventPost Mach IPC。
+/// Mutate a scroll CGEvent in place into a discrete line-unit event (isContinuous=0,
+/// hasPreciseScrollingDeltas=false) with zero CGEventPost Mach IPC.
+unsafe fn mutate_scroll_line_in_place(event: CGEventRef, dy: i32, dx: i32) {
+    let dy64 = dy as i64;
+    let dx64 = dx as i64;
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 0);
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, dy64);
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, dx64);
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, dy64 * 10);
+    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, dx64 * 10);
+    CGEventSetDoubleValueField(
+        event,
+        K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
+        dy as f64,
+    );
+    CGEventSetDoubleValueField(
+        event,
+        K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
+        dx as f64,
+    );
+    CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
+}
 
-    CGEventPost(K_CG_SESSION_EVENT_TAP, synthetic);
-    CFRelease(synthetic as *const c_void);
+unsafe fn apply_scroll_in_place(event: CGEventRef, dy: i32, dx: i32, unit: ScrollUnit) {
+    if dy == 0 && dx == 0 {
+        return;
+    }
+    match unit {
+        ScrollUnit::Line => mutate_scroll_line_in_place(event, dy, dx),
+        ScrollUnit::Pixel => mutate_scroll_pixel_in_place(event, dy as i64, dx as i64),
+    }
 }
 
 /// 把事件类型翻译成可读名称,便于日志阅读。
@@ -266,20 +231,16 @@ unsafe extern "C" fn mouse_event_tap_callback(
         return event;
     }
 
-    let flags: CGEventFlags = CGEventGetFlags(event);
-
     if event_type == K_CG_EVENT_SCROLL_WHEEL {
-        // 跳过自己或协调器标记的合成滚轮事件,避免 HID tap 重复拦截或回环。
+        // 跳过自己或协调器标记的合成滚轮事件,避免重复处理。
         // Skip synthetic scroll events carrying our marker or the Mos compatibility marker.
         let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
         if is_synthetic_scroll_marker(user_data) {
             return event;
         }
 
-        // continuous=1 表示连续(像素级)滚动事件,来自触摸板/Magic Mouse。
-        // 我们的两种模式只处理鼠标滚轮(离散事件),触摸板跳过。
+        // continuous=1 表示连续(像素级)滚动事件,来自触摸板/Magic Mouse,直接放行。
         // continuous=1 means a continuous (pixel-level) scroll event from a trackpad / Magic Mouse.
-        // Both modes handle only discrete mouse wheel events; trackpad is skipped.
         let continuous = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS);
         if continuous != 0 {
             return event;
@@ -289,46 +250,62 @@ unsafe extern "C" fn mouse_event_tap_callback(
         // deltaAxis1 = vertical delta, deltaAxis2 = horizontal delta.
         let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
         let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
-        // 连续模式需要像素级 delta;若硬件事件未提供,按 1 line = 10 px 兜底。
-        // Continuous mode needs pixel-level deltas; fall back to 1 line = 10 px when the
-        // hardware event does not provide them.
-        let raw_point_dy =
-            CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-        let raw_point_dx =
-            CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
-        let (point_dy, point_dx) = if raw_point_dy == 0 && raw_point_dx == 0 {
-            (dy * 10, dx * 10)
-        } else {
-            (raw_point_dy, raw_point_dx)
-        };
 
-        // app 归因:按"光标下的窗口"找 app(macOS 把滚轮派发给光标下的窗口,不是
-        // key window;只看前台 app 在不激活直接滚失焦窗口时永不命中),hit-test 失败
-        // 回退前台 app,保持原有行为。
-        // App attribution: resolve the app from the window under the cursor (macOS
-        // dispatches wheel events to the window under the pointer, not the key window;
-        // the frontmost app alone never hits when scrolling an unfocused window without
-        // activating it). Fall back to the frontmost app on a hit-test miss, preserving
-        // the previous behavior.
+        let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
+        if !debug_enabled && !resolve::has_per_device_profiles() {
+            // 零分配、零 HashMap、零 CGEventPost 的快速热路径:直接复制预解析的 12B 滚动参数
+            // 并原地修改 CGEvent 返回,使回调稳定远低于 8000 Hz 轮询周期(125 us)。
+            // Zero-allocation, zero-HashMap, zero-CGEventPost fast path: copy pre-resolved scroll
+            // config and mutate the CGEvent in place to stay well below the 8000 Hz (125 us) budget.
+            let scroll = if resolve::has_per_app_scroll_profiles() {
+                let loc = CGEventGetLocation(event);
+                app::scroll_at_point_or_active(loc.x, loc.y)
+            } else {
+                app::active_scroll()
+            };
+            if scroll.scroll_mode == ScrollMode::Continuous {
+                let raw_point_dy =
+                    CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+                let raw_point_dx =
+                    CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
+                let (point_dy, point_dx) = if raw_point_dy == 0 && raw_point_dx == 0 {
+                    (dy * 10, dx * 10)
+                } else {
+                    (raw_point_dy, raw_point_dx)
+                };
+                let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, scroll);
+                if ndy != 0 || ndx != 0 {
+                    mutate_scroll_pixel_in_place(event, ndy, ndx);
+                }
+            } else {
+                let (ndy, ndx, unit) = compute_delta(dy, dx, scroll);
+                apply_scroll_in_place(event, ndy, ndx, unit);
+            }
+            return event;
+        }
+
+        let flags: CGEventFlags = CGEventGetFlags(event);
         let loc = CGEventGetLocation(event);
         let app_key = scroll_app_at_cursor(loc.x, loc.y).or_else(app::active_identity);
-        let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
-        // 设备归因:仅在配置了 per-device 档或开启 debug 日志时读取 senderID 归因设备。
-        // Device attribution: query the HID sender only when per-device profiles or debug logging need it.
         let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
             device::device_from_cgevent(event)
         } else {
             None
         };
         let resolved = resolve::resolve(dev_key, app_key.clone());
+        let scroll = resolved.scroll();
 
-        // Continuous:像素级透传 + 反转,合成连续事件。Default / Line / Pixel / Discrete:
-        // 计算 delta 与单位 -> post 合成事件。无论哪种都丢弃原 event。
-        // Continuous: pixel passthrough + reverse, then post a continuous event.
-        // Default / Line / Pixel / Discrete: compute delta and unit -> post synthetic event.
-        // Either way the original event is dropped.
-        if resolved.scroll_mode == ScrollMode::Continuous {
-            let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, &resolved);
+        if scroll.scroll_mode == ScrollMode::Continuous {
+            let raw_point_dy =
+                CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+            let raw_point_dx =
+                CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
+            let (point_dy, point_dx) = if raw_point_dy == 0 && raw_point_dx == 0 {
+                (dy * 10, dx * 10)
+            } else {
+                (raw_point_dy, raw_point_dx)
+            };
+            let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, scroll);
             if debug_enabled {
                 log_debug!(
                     "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode=continuous out=({},{},cont) flags=0x{:x} reverse={}",
@@ -341,12 +318,14 @@ unsafe extern "C" fn mouse_event_tap_callback(
                     ndy,
                     ndx,
                     flags,
-                    resolved.reverse_scroll
+                    scroll.reverse_scroll
                 );
             }
-            post_continuous_scroll_event(ndy, ndx, flags, loc);
+            if ndy != 0 || ndx != 0 {
+                mutate_scroll_pixel_in_place(event, ndy, ndx);
+            }
         } else {
-            let (ndy, ndx, unit) = compute_delta(dy, dx, &resolved);
+            let (ndy, ndx, unit) = compute_delta(dy, dx, scroll);
             if debug_enabled {
                 log_debug!(
                     "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode={} lc={} lh={:?} out=({},{},{:?}) flags=0x{:x} reverse={}",
@@ -356,20 +335,21 @@ unsafe extern "C" fn mouse_event_tap_callback(
                     loc.y,
                     dy,
                     dx,
-                    resolved.scroll_mode.as_str(),
-                    resolved.line_count,
-                    resolved.line_height,
+                    scroll.scroll_mode.as_str(),
+                    scroll.line_count,
+                    scroll.line_height,
                     ndy,
                     ndx,
                     unit,
                     flags,
-                    resolved.reverse_scroll
+                    scroll.reverse_scroll
                 );
             }
-            post_scroll_event(ndy, ndx, unit, flags, loc);
+            apply_scroll_in_place(event, ndy, ndx, unit);
         }
-        std::ptr::null_mut()
+        event
     } else if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN || event_type == K_CG_EVENT_OTHER_MOUSE_UP {
+        let flags: CGEventFlags = CGEventGetFlags(event);
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
         let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
         log_button_event_diag(event_type, event, button, flags);
@@ -404,6 +384,7 @@ unsafe extern "C" fn mouse_event_tap_callback(
         }
         event
     } else {
+        let flags: CGEventFlags = CGEventGetFlags(event);
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
         log_button_event_diag(event_type, event, button, flags);
         event
@@ -472,12 +453,19 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("mouse-tap".into())
         .spawn(move || unsafe {
+            let _ = ffi::pthread_set_qos_class_self_np(ffi::QOS_CLASS_USER_INTERACTIVE, 0);
             let rl = CFRunLoopGetCurrent();
             device::start_plug_monitor();
             device::ensure_enumerated();
 
+            // 挂在 Session 层(kCGSessionEventTap)并原地改写 CGEvent 返回:
+            // 1) 不阻塞 kCGHIDEventTap,避免高速滚轮后抢占或卡滞 8000 Hz 指针移动事件;
+            // 2) 位于系统自然滚动与 HID 加速之后、下游 Mos(AnnotatedSession) 之前,原地改写即可生效且零 CGEventPost IPC。
+            // Hook kCGSessionEventTap and mutate scroll CGEvents in place:
+            // 1) leaves kCGHIDEventTap unblocked so 8000 Hz mouseMoved never stalls behind scroll ticks;
+            // 2) runs after HID natural-scroll/acceleration and before Mos (AnnotatedSession) with zero CGEventPost IPC.
             let tap = ffi::create_tap_with_retry(
-                tap_location::HID_EVENT_TAP,
+                tap_location::SESSION_EVENT_TAP,
                 tap_placement::HEAD_INSERT,
                 tap_options::DEFAULT_TAP,
                 mask,

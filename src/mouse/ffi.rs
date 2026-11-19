@@ -97,12 +97,10 @@ extern "C" {
     pub(crate) fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     pub(crate) fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
     pub(crate) fn CGEventSetIntegerValueField(event: CGEventRef, field: i32, value: i64);
+    pub(crate) fn CGEventSetDoubleValueField(event: CGEventRef, field: i32, value: f64);
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
-    // 创建一个空 CGEvent。source 传 null 表示默认 source;后续用字段 55 设置事件类型。
-    // Create an empty CGEvent. source=null uses the default source; set field 55 afterwards
-    // for the event type.
-    pub(crate) fn CGEventCreate(source: *const c_void) -> CGEventRef;
     // 合成键盘事件。source 传 null 表示默认 source;key_down 用 1/0 对应 Boolean。
     // Create a synthetic keyboard event. null source = default; key_down uses 1/0 (Boolean).
     #[cfg_attr(test, allow(dead_code))]
@@ -122,28 +120,17 @@ extern "C" {
     // y down; the same space as kCGWindowBounds). Used for window-under-cursor app
     // attribution of scroll events.
     pub(crate) fn CGEventGetLocation(event: CGEventRef) -> CGPointFFI;
-    // 写入合成事件的光标坐标,保证基于坐标分发的宿主应用能正确路由滚轮事件。
-    // Set the cursor location on synthetic events so coordinate-routed apps dispatch accurately.
-    pub(crate) fn CGEventSetLocation(event: CGEventRef, location: CGPointFFI);
 
-    // 合成全新的滚轮事件。source 传 null 表示用默认 source;wheelCount 通常为 2
-    // (wheel1=垂直,wheel2=水平)。
-    // Create a brand-new scroll wheel event. source=null for the default source; wheelCount is
-    // usually 2 (wheel1=vertical, wheel2=horizontal).
-    pub(crate) fn CGEventCreateScrollWheelEvent2(
-        source: *const c_void,
-        units: u32,
-        wheel_count: u32,
-        wheel1: i32,
-        wheel2: i32,
-        wheel3: i32,
-    ) -> CGEventRef;
-
-    // 将事件投递到指定 tap 层级。kCGSessionEventTap=1 投递到 session 层,
-    // 不经过 HID 层 tap,绕过系统自然滚动的 HID 层覆盖。
-    // Post an event to a tap level. kCGSessionEventTap=1 posts to the session level,
-    // bypassing HID-level taps and thus the system's natural-scroll override at the HID layer.
+    // 将合成按键事件投递到指定 tap 层级(buttons.rs 后台线程使用)。
+    // Post a synthetic key event to a tap level (used on buttons.rs background worker).
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CGEventPost(tap: i32, event: CGEventRef);
+}
+
+pub(crate) const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+extern "C" {
+    pub(crate) fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
 }
 
 // ========== CoreFoundation FFI ==========
@@ -555,11 +542,6 @@ pub(crate) const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2: i32 = 12;
 /// Whether the event is continuous (pixel-level) scroll. field 88. 0=discrete (line), 1=continuous (trackpad).
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS: i32 = 88;
 
-/// CGEvent 类型字段。field 55。合成连续事件时用于显式设为 22(kCGEventScrollWheel)。
-/// CGEvent type field. field 55. Used when synthesizing continuous events to explicitly
-/// set 22 (kCGEventScrollWheel).
-pub(crate) const K_CG_EVENT_TYPE: i32 = 55;
-
 /// 像素级滚动量(垂直)。field 96。
 /// Pixel-level vertical scroll delta. field 96.
 pub(crate) const K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1: i32 = 96;
@@ -575,28 +557,12 @@ pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2: i32 = 94;
 
 // ========== 事件合成相关常量 / synthetic event constants ==========
 
-/// CGEventPost 的 tap location:kCGSessionEventTap=1。
-/// 合成事件 post 到 session 层,不经过 HID 层 tap,绕过系统自然滚动覆盖。
-/// CGEventPost tap location: kCGSessionEventTap=1.
-/// Synthetic events posted at session level bypass HID-level taps, avoiding the system's
-/// natural-scroll override at the HID layer.
-pub(crate) const K_CG_SESSION_EVENT_TAP: i32 = 1;
-
 /// CGEventPost 的 HID 层 tap location(kCGHIDEventTap=0)。媒体/系统键
 /// (NSSystemDefined)按权威实现投递到这一层才生效。
 /// CGEventPost HID-level tap location (kCGHIDEventTap=0). Media/system keys
 /// (NSSystemDefined) only take effect when posted at this level, per the reference impl.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const K_CG_HID_EVENT_TAP: i32 = 0;
-
-/// CGEventCreateScrollWheelEvent2 的 units:kCGScrollEventUnitLine=1(行级,离散滚动)。
-/// CGEventCreateScrollWheelEvent2 units: kCGScrollEventUnitLine=1 (line-level, discrete scroll).
-pub(crate) const K_CG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
-
-/// kCGScrollEventUnitPixel=0(像素级,离散滚动;line_height 模式用)。
-/// kCGScrollEventUnitPixel=0 (pixel-level, discrete scroll; used by the line_height mode).
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 0;
 
 /// eventSourceUserData 字段(field 42)。用于在合成事件上打标记,防止自己的 tap 无限循环。
 /// eventSourceUserData field (field 42). Used to tag synthetic events so our own tap can
