@@ -38,52 +38,58 @@ fn line_delta_from_point(point: i64) -> i64 {
 unsafe fn mutate_scroll_pixel_in_place(event: CGEventRef, point_dy: i64, point_dx: i64) {
     let line_dy = line_delta_from_point(point_dy);
     let line_dx = line_delta_from_point(point_dx);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, line_dy);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, line_dx);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, point_dy);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, point_dx);
-    CGEventSetDoubleValueField(
-        event,
-        K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
-        point_dy as f64 / 10.0,
-    );
-    CGEventSetDoubleValueField(
-        event,
-        K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
-        point_dx as f64 / 10.0,
-    );
-    CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
+    unsafe {
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 1);
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, line_dy);
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, line_dx);
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, point_dy);
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, point_dx);
+        CGEventSetDoubleValueField(
+            event,
+            K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
+            point_dy as f64 / 10.0,
+        );
+        CGEventSetDoubleValueField(
+            event,
+            K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
+            point_dx as f64 / 10.0,
+        );
+        CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
+    }
 }
 
 unsafe fn mutate_scroll_line_in_place(event: CGEventRef, dy: i32, dx: i32) {
     let dy64 = dy as i64;
     let dx64 = dx as i64;
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 0);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, dy64);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, dx64);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, dy64 * 10);
-    CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, dx64 * 10);
-    CGEventSetDoubleValueField(
-        event,
-        K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
-        dy as f64,
-    );
-    CGEventSetDoubleValueField(
-        event,
-        K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
-        dx as f64,
-    );
-    CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
+    unsafe {
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 0);
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, dy64);
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, dx64);
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, dy64 * 10);
+        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, dx64 * 10);
+        CGEventSetDoubleValueField(
+            event,
+            K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
+            dy as f64,
+        );
+        CGEventSetDoubleValueField(
+            event,
+            K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
+            dx as f64,
+        );
+        CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
+    }
 }
 
 unsafe fn apply_scroll_in_place(event: CGEventRef, dy: i32, dx: i32, unit: ScrollUnit) {
     if dy == 0 && dx == 0 {
         return;
     }
-    match unit {
-        ScrollUnit::Line => mutate_scroll_line_in_place(event, dy, dx),
-        ScrollUnit::Pixel => mutate_scroll_pixel_in_place(event, dy as i64, dx as i64),
+    unsafe {
+        match unit {
+            ScrollUnit::Line => mutate_scroll_line_in_place(event, dy, dx),
+            ScrollUnit::Pixel => mutate_scroll_pixel_in_place(event, dy as i64, dx as i64),
+        }
     }
 }
 
@@ -164,49 +170,85 @@ unsafe extern "C" fn mouse_event_tap_callback(
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
-    if event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
-        || event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
-    {
-        if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
-            let tap = CURRENT_TAP.with(|c| c.get());
-            if !tap.is_null() {
-                ffi::CGEventTapEnable(tap, true);
-                log_info!(
-                    "[mouse] event tap disabled by system (type=0x{:x}); re-enabled.",
-                    event_type
-                );
+    unsafe {
+        if event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+            || event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+        {
+            if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                let tap = CURRENT_TAP.with(|c| c.get());
+                if !tap.is_null() {
+                    ffi::CGEventTapEnable(tap, true);
+                    log_info!(
+                        "[mouse] event tap disabled by system (type=0x{:x}); re-enabled.",
+                        event_type
+                    );
+                }
             }
+            return event;
         }
-        return event;
-    }
-    if event.is_null() {
-        return event;
-    }
-
-    if event_type == K_CG_EVENT_SCROLL_WHEEL {
-
-        let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
-        if is_synthetic_scroll_marker(user_data) {
+        if event.is_null() {
             return event;
         }
 
-        let continuous = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS);
-        if continuous != 0 {
-            return event;
-        }
+        if event_type == K_CG_EVENT_SCROLL_WHEEL {
+            let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
+            if is_synthetic_scroll_marker(user_data) {
+                return event;
+            }
 
-        let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
-        let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
+            let continuous =
+                CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS);
+            if continuous != 0 {
+                return event;
+            }
 
-        let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
-        if !debug_enabled && !resolve::has_per_device_profiles() {
+            let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
+            let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
 
-            let scroll = if resolve::has_per_app_scroll_profiles() {
-                let loc = CGEventGetLocation(event);
-                app::scroll_at_point_or_active(loc.x, loc.y)
+            let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
+            if !debug_enabled && !resolve::has_per_device_profiles() {
+                let scroll = if resolve::has_per_app_scroll_profiles() {
+                    let loc = CGEventGetLocation(event);
+                    app::scroll_at_point_or_active(loc.x, loc.y)
+                } else {
+                    app::active_scroll()
+                };
+                if scroll.scroll_mode == ScrollMode::Continuous {
+                    let raw_point_dy = CGEventGetIntegerValueField(
+                        event,
+                        K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
+                    );
+                    let raw_point_dx = CGEventGetIntegerValueField(
+                        event,
+                        K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+                    );
+                    let (point_dy, point_dx) = if raw_point_dy == 0 && raw_point_dx == 0 {
+                        (dy * 10, dx * 10)
+                    } else {
+                        (raw_point_dy, raw_point_dx)
+                    };
+                    let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, scroll);
+                    if ndy != 0 || ndx != 0 {
+                        mutate_scroll_pixel_in_place(event, ndy, ndx);
+                    }
+                } else {
+                    let (ndy, ndx, unit) = compute_delta(dy, dx, scroll);
+                    apply_scroll_in_place(event, ndy, ndx, unit);
+                }
+                return event;
+            }
+
+            let flags: CGEventFlags = CGEventGetFlags(event);
+            let loc = CGEventGetLocation(event);
+            let app_key = scroll_app_at_cursor(loc.x, loc.y).or_else(app::active_identity);
+            let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
+                device::device_from_cgevent(event)
             } else {
-                app::active_scroll()
+                None
             };
+            let resolved = resolve::resolve(dev_key, app_key.clone());
+            let scroll = resolved.scroll();
+
             if scroll.scroll_mode == ScrollMode::Continuous {
                 let raw_point_dy =
                     CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
@@ -218,115 +260,86 @@ unsafe extern "C" fn mouse_event_tap_callback(
                     (raw_point_dy, raw_point_dx)
                 };
                 let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, scroll);
+                if debug_enabled {
+                    log_debug!(
+                        "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode=continuous out=({},{},cont) flags=0x{:x} reverse={}",
+                        dev_key,
+                        app_key,
+                        loc.x,
+                        loc.y,
+                        dy,
+                        dx,
+                        ndy,
+                        ndx,
+                        flags,
+                        scroll.reverse_scroll
+                    );
+                }
                 if ndy != 0 || ndx != 0 {
                     mutate_scroll_pixel_in_place(event, ndy, ndx);
                 }
             } else {
                 let (ndy, ndx, unit) = compute_delta(dy, dx, scroll);
+                if debug_enabled {
+                    log_debug!(
+                        "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode={} lc={} lh={:?} out=({},{},{:?}) flags=0x{:x} reverse={}",
+                        dev_key,
+                        app_key,
+                        loc.x,
+                        loc.y,
+                        dy,
+                        dx,
+                        scroll.scroll_mode.as_str(),
+                        scroll.line_count,
+                        scroll.line_height,
+                        ndy,
+                        ndx,
+                        unit,
+                        flags,
+                        scroll.reverse_scroll
+                    );
+                }
                 apply_scroll_in_place(event, ndy, ndx, unit);
             }
-            return event;
-        }
+            event
+        } else if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN
+            || event_type == K_CG_EVENT_OTHER_MOUSE_UP
+        {
+            let flags: CGEventFlags = CGEventGetFlags(event);
+            let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
+            let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
+            log_button_event_diag(event_type, event, button, flags);
 
-        let flags: CGEventFlags = CGEventGetFlags(event);
-        let loc = CGEventGetLocation(event);
-        let app_key = scroll_app_at_cursor(loc.x, loc.y).or_else(app::active_identity);
-        let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
-            device::device_from_cgevent(event)
-        } else {
-            None
-        };
-        let resolved = resolve::resolve(dev_key, app_key.clone());
-        let scroll = resolved.scroll();
-
-        if scroll.scroll_mode == ScrollMode::Continuous {
-            let raw_point_dy =
-                CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-            let raw_point_dx =
-                CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
-            let (point_dy, point_dx) = if raw_point_dy == 0 && raw_point_dx == 0 {
-                (dy * 10, dx * 10)
+            let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
+                device::device_from_cgevent(event)
             } else {
-                (raw_point_dy, raw_point_dx)
+                None
             };
-            let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, scroll);
-            if debug_enabled {
+            let app_key = app::active_identity();
+            let resolved = resolve::resolve(dev_key, app_key.clone());
+            if let Some(action) = resolved.button_map.get(&(button as u32)) {
                 log_debug!(
-                    "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode=continuous out=({},{},cont) flags=0x{:x} reverse={}",
+                    "[mouse] button {}({}) mapped to {:?} (dev={:?}, app={:?})",
+                    button,
+                    button_name(button),
+                    action,
                     dev_key,
-                    app_key,
-                    loc.x,
-                    loc.y,
-                    dy,
-                    dx,
-                    ndy,
-                    ndx,
-                    flags,
-                    scroll.reverse_scroll
+                    app_key
                 );
+                if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN {
+                    buttons::handle_down(button as u32, action);
+                } else {
+                    buttons::handle_up(button as u32);
+                }
+                return std::ptr::null_mut();
             }
-            if ndy != 0 || ndx != 0 {
-                mutate_scroll_pixel_in_place(event, ndy, ndx);
-            }
+            event
         } else {
-            let (ndy, ndx, unit) = compute_delta(dy, dx, scroll);
-            if debug_enabled {
-                log_debug!(
-                    "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode={} lc={} lh={:?} out=({},{},{:?}) flags=0x{:x} reverse={}",
-                    dev_key,
-                    app_key,
-                    loc.x,
-                    loc.y,
-                    dy,
-                    dx,
-                    scroll.scroll_mode.as_str(),
-                    scroll.line_count,
-                    scroll.line_height,
-                    ndy,
-                    ndx,
-                    unit,
-                    flags,
-                    scroll.reverse_scroll
-                );
-            }
-            apply_scroll_in_place(event, ndy, ndx, unit);
+            let flags: CGEventFlags = CGEventGetFlags(event);
+            let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
+            log_button_event_diag(event_type, event, button, flags);
+            event
         }
-        event
-    } else if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN || event_type == K_CG_EVENT_OTHER_MOUSE_UP {
-        let flags: CGEventFlags = CGEventGetFlags(event);
-        let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
-        let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
-        log_button_event_diag(event_type, event, button, flags);
-
-        let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
-            device::device_from_cgevent(event)
-        } else {
-            None
-        };
-        let app_key = app::active_identity();
-        let resolved = resolve::resolve(dev_key, app_key.clone());
-        if let Some(action) = resolved.button_map.get(&(button as u32)) {
-            log_debug!(
-                "[mouse] button {}({}) mapped to {:?} (dev={:?}, app={:?})",
-                button,
-                button_name(button),
-                action,
-                dev_key,
-                app_key
-            );
-            if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN {
-                buttons::handle_down(button as u32, action);
-            } else {
-                buttons::handle_up(button as u32);
-            }
-            return std::ptr::null_mut();
-        }
-        event
-    } else {
-        let flags: CGEventFlags = CGEventGetFlags(event);
-        let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
-        log_button_event_diag(event_type, event, button, flags);
-        event
     }
 }
 

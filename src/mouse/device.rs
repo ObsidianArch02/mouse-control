@@ -170,27 +170,31 @@ fn registry() -> &'static Mutex<DeviceRegistry> {
 }
 
 unsafe fn prop_int(service: *mut c_void, key: &str) -> Option<i64> {
-    let k = make_nsstring(key);
-    let v = IOHIDServiceClientCopyProperty(service, k as *const c_void);
-    CFRelease(k as *const c_void);
-    if v.is_null() {
-        return None;
+    unsafe {
+        let k = make_nsstring(key);
+        let v = IOHIDServiceClientCopyProperty(service, k as *const c_void);
+        CFRelease(k as *const c_void);
+        if v.is_null() {
+            return None;
+        }
+        let i: i64 = msg_send![v as *mut AnyObject, longLongValue];
+        CFRelease(v as *const c_void);
+        Some(i)
     }
-    let i: i64 = msg_send![v as *mut AnyObject, longLongValue];
-    CFRelease(v as *const c_void);
-    Some(i)
 }
 
 unsafe fn prop_string(service: *mut c_void, key: &str) -> String {
-    let k = make_nsstring(key);
-    let v = IOHIDServiceClientCopyProperty(service, k as *const c_void);
-    CFRelease(k as *const c_void);
-    if v.is_null() {
-        return String::new();
+    unsafe {
+        let k = make_nsstring(key);
+        let v = IOHIDServiceClientCopyProperty(service, k as *const c_void);
+        CFRelease(k as *const c_void);
+        if v.is_null() {
+            return String::new();
+        }
+        let s = nsstring_to_rust(v as *mut AnyObject);
+        CFRelease(v as *const c_void);
+        s
     }
-    let s = nsstring_to_rust(v as *mut AnyObject);
-    CFRelease(v as *const c_void);
-    s
 }
 
 struct RegistryState {
@@ -296,7 +300,6 @@ unsafe fn build_state() -> RegistryState {
 
 unsafe fn swap_state(new: RegistryState) {
     if new.client.is_null() {
-
         return;
     }
     let (old_client, old_services, old_rl) = {
@@ -312,29 +315,33 @@ unsafe fn swap_state(new: RegistryState) {
         reg.scheduled_rl = new.scheduled_rl;
         (old_client, old_services, old_rl)
     };
-    if !old_services.is_null() {
-        CFRelease(old_services as *const c_void);
-    }
-    if !old_client.is_null() {
-        if let Some(rl) = old_rl {
-            IOHIDEventSystemClientUnscheduleWithRunLoop(
-                old_client,
-                rl,
-                crate::mouse::ffi::kCFRunLoopDefaultMode,
-            );
+    unsafe {
+        if !old_services.is_null() {
+            CFRelease(old_services as *const c_void);
+        }
+        if !old_client.is_null() {
+            if let Some(rl) = old_rl {
+                IOHIDEventSystemClientUnscheduleWithRunLoop(
+                    old_client,
+                    rl,
+                    crate::mouse::ffi::kCFRunLoopDefaultMode,
+                );
+                CFRelease(rl as *const c_void);
+            }
+            CFRelease(old_client as *const c_void);
+        } else if let Some(rl) = old_rl {
             CFRelease(rl as *const c_void);
         }
-        CFRelease(old_client as *const c_void);
-    } else if let Some(rl) = old_rl {
-        CFRelease(rl as *const c_void);
     }
 }
 
 unsafe fn rebuild_and_swap() -> usize {
-    let state = build_state();
-    let count = state.devices.len();
-    swap_state(state);
-    count
+    unsafe {
+        let state = build_state();
+        let count = state.devices.len();
+        swap_state(state);
+        count
+    }
 }
 
 pub(crate) fn ensure_enumerated() {
@@ -451,7 +458,7 @@ fn ensure_plug_worker() {
 }
 
 unsafe fn handle_plug_event() {
-    let count = rebuild_and_swap();
+    let count = unsafe { rebuild_and_swap() };
     log_debug!(
         "[device] plug/unplug event: re-enumerated {} device(s).",
         count
@@ -477,18 +484,20 @@ unsafe fn lookup_service_index(reg: &DeviceRegistry, sender: u64) -> Option<usiz
     if reg.client.is_null() {
         return None;
     }
-    let svc = IOHIDEventSystemClientCopyServiceForRegistryID(reg.client, sender);
-    if svc.is_null() {
-        return None;
+    unsafe {
+        let svc = IOHIDEventSystemClientCopyServiceForRegistryID(reg.client, sender);
+        if svc.is_null() {
+            return None;
+        }
+
+        let idx = reg
+            .devices
+            .iter()
+            .position(|d| crate::ffi::CFEqual(d.service_client, svc));
+
+        CFRelease(svc as *const c_void);
+        idx
     }
-
-    let idx = reg
-        .devices
-        .iter()
-        .position(|d| crate::ffi::CFEqual(d.service_client, svc));
-
-    CFRelease(svc as *const c_void);
-    idx
 }
 
 pub(crate) fn device_from_cgevent(cg_event: crate::mouse::ffi::CGEventRef) -> Option<DeviceKey> {

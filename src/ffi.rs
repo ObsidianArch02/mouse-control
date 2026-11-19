@@ -4,7 +4,7 @@ use objc2::runtime::{AnyObject, Sel};
 use std::ffi::{c_char, c_void, CString};
 
 #[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn CFStringCreateWithCString(
         alloc: *const c_void,
         c_str: *const c_char,
@@ -31,17 +31,17 @@ extern "C" {
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn AXIsProcessTrusted() -> bool;
     pub(crate) fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
     pub(crate) static kAXTrustedCheckOptionPrompt: *const c_void;
 }
 
 #[link(name = "AppKit", kind = "framework")]
-extern "C" {}
+unsafe extern "C" {}
 
 #[link(name = "objc", kind = "dylib")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn objc_allocateClassPair(
         superclass: *mut AnyObject,
         name: *const c_char,
@@ -75,9 +75,11 @@ pub(crate) unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
     if utf8.is_null() {
         return String::new();
     }
-    std::ffi::CStr::from_ptr(utf8)
-        .to_string_lossy()
-        .into_owned()
+    unsafe {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 pub(crate) fn has_accessibility_permission() -> bool {

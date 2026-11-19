@@ -156,7 +156,7 @@ unsafe fn optional_nsstring_to_rust(ns: *mut AnyObject) -> Option<String> {
     if ns.is_null() {
         return None;
     }
-    let s = nsstring_to_rust(ns);
+    let s = unsafe { nsstring_to_rust(ns) };
     if s.is_empty() {
         None
     } else {
@@ -165,8 +165,10 @@ unsafe fn optional_nsstring_to_rust(ns: *mut AnyObject) -> Option<String> {
 }
 
 unsafe fn frontmost_application() -> *mut AnyObject {
-    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-    msg_send![workspace, frontmostApplication]
+    unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        msg_send![workspace, frontmostApplication]
+    }
 }
 
 unsafe fn app_from_notification(notification: *mut c_void) -> *mut AnyObject {
@@ -174,15 +176,17 @@ unsafe fn app_from_notification(notification: *mut c_void) -> *mut AnyObject {
         return std::ptr::null_mut();
     }
 
-    let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
-    if user_info.is_null() {
-        return std::ptr::null_mut();
-    }
+    unsafe {
+        let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
+        if user_info.is_null() {
+            return std::ptr::null_mut();
+        }
 
-    let key = make_nsstring("NSWorkspaceApplicationKey");
-    let app: *mut AnyObject = msg_send![user_info, objectForKey: key];
-    CFRelease(key as *const c_void);
-    app
+        let key = make_nsstring("NSWorkspaceApplicationKey");
+        let app: *mut AnyObject = msg_send![user_info, objectForKey: key];
+        CFRelease(key as *const c_void);
+        app
+    }
 }
 
 unsafe fn identity_from_running_app(app: *mut AnyObject) -> AppIdentity {
@@ -192,23 +196,27 @@ unsafe fn identity_from_running_app(app: *mut AnyObject) -> AppIdentity {
             localized_name: None,
         };
     }
-    let bundle: *mut AnyObject = msg_send![app, bundleIdentifier];
-    let name: *mut AnyObject = msg_send![app, localizedName];
-    AppIdentity {
-        bundle_id: optional_nsstring_to_rust(bundle),
-        localized_name: optional_nsstring_to_rust(name),
+    unsafe {
+        let bundle: *mut AnyObject = msg_send![app, bundleIdentifier];
+        let name: *mut AnyObject = msg_send![app, localizedName];
+        AppIdentity {
+            bundle_id: optional_nsstring_to_rust(bundle),
+            localized_name: optional_nsstring_to_rust(name),
+        }
     }
 }
 
 unsafe fn cached_app_from_running_app(app: *mut AnyObject) -> CachedApp {
-    let activation_policy: isize = if app.is_null() {
-        ACTIVATION_POLICY_PROHIBITED
-    } else {
-        msg_send![app, activationPolicy]
-    };
-    CachedApp {
-        identity: identity_from_running_app(app),
-        activation_policy,
+    unsafe {
+        let activation_policy: isize = if app.is_null() {
+            ACTIVATION_POLICY_PROHIBITED
+        } else {
+            msg_send![app, activationPolicy]
+        };
+        CachedApp {
+            identity: identity_from_running_app(app),
+            activation_policy,
+        }
     }
 }
 
@@ -300,7 +308,7 @@ unsafe fn lookup_or_query_pid(pid: i32) -> Option<CachedApp> {
         class!(NSRunningApplication),
         runningApplicationWithProcessIdentifier: pid
     ];
-    let entry = cached_app_from_running_app(app);
+    let entry = unsafe { cached_app_from_running_app(app) };
     let mut map = PID_MAP.lock().unwrap();
     if map.len() >= PID_MAP_MAX && !map.contains_key(&pid) {
         map.retain(|_, v| v.activation_policy != ACTIVATION_POLICY_PROHIBITED);
@@ -313,74 +321,76 @@ unsafe fn lookup_or_query_pid(pid: i32) -> Option<CachedApp> {
 }
 
 unsafe fn capture_window_rects() -> Vec<WindowRect> {
-    let list = CGWindowListCopyWindowInfo(
-        K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
-        0,
-    );
-    if list.is_null() {
-        return Vec::new();
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(
+            K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+            0,
+        );
+        if list.is_null() {
+            return Vec::new();
+        }
+        let count = CFArrayGetCount(list);
+        let mut windows = Vec::with_capacity(count.max(0) as usize);
+        for i in 0..count {
+            let w = CFArrayGetValueAtIndex(list, i);
+            if w.is_null() {
+                continue;
+            }
+            let Some(layer) = read_dict_int(w, kCGWindowLayer) else {
+                continue;
+            };
+            if !(0..MAX_WINDOW_LAYER).contains(&layer) {
+                continue;
+            }
+            let alpha = read_dict_f64(w, kCGWindowAlpha).unwrap_or(1.0);
+            if !alpha.is_finite() || alpha <= 0.0 {
+                continue;
+            }
+            let bounds_dict = CFDictionaryGetValue(w, kCGWindowBounds);
+            if bounds_dict.is_null() {
+                continue;
+            }
+            let mut rect = CGRectFFI::default();
+            if !CGRectMakeWithDictionaryRepresentation(bounds_dict, &mut rect) {
+                continue;
+            }
+            if !rect.origin.x.is_finite()
+                || !rect.origin.y.is_finite()
+                || !rect.size.width.is_finite()
+                || !rect.size.height.is_finite()
+                || rect.size.width <= 0.0
+                || rect.size.height <= 0.0
+            {
+                continue;
+            }
+            let Some(pid) = read_dict_int(w, kCGWindowOwnerPID) else {
+                continue;
+            };
+            let cached = lookup_or_query_pid(pid);
+            if !should_include_window(
+                layer,
+                alpha,
+                rect.size.width,
+                rect.size.height,
+                cached.as_ref(),
+            ) {
+                continue;
+            }
+            if let Some(cached) = cached {
+                let scroll = crate::mouse::resolve::resolve_scroll_for_app(Some(&cached.identity));
+                windows.push(WindowRect {
+                    x0: rect.origin.x,
+                    y0: rect.origin.y,
+                    x1: rect.origin.x + rect.size.width,
+                    y1: rect.origin.y + rect.size.height,
+                    identity: cached.identity,
+                    scroll,
+                });
+            }
+        }
+        CFRelease(list);
+        windows
     }
-    let count = CFArrayGetCount(list);
-    let mut windows = Vec::with_capacity(count.max(0) as usize);
-    for i in 0..count {
-        let w = CFArrayGetValueAtIndex(list, i);
-        if w.is_null() {
-            continue;
-        }
-        let Some(layer) = read_dict_int(w, kCGWindowLayer) else {
-            continue;
-        };
-        if !(0..MAX_WINDOW_LAYER).contains(&layer) {
-            continue;
-        }
-        let alpha = read_dict_f64(w, kCGWindowAlpha).unwrap_or(1.0);
-        if !alpha.is_finite() || alpha <= 0.0 {
-            continue;
-        }
-        let bounds_dict = CFDictionaryGetValue(w, kCGWindowBounds);
-        if bounds_dict.is_null() {
-            continue;
-        }
-        let mut rect = CGRectFFI::default();
-        if !CGRectMakeWithDictionaryRepresentation(bounds_dict, &mut rect) {
-            continue;
-        }
-        if !rect.origin.x.is_finite()
-            || !rect.origin.y.is_finite()
-            || !rect.size.width.is_finite()
-            || !rect.size.height.is_finite()
-            || rect.size.width <= 0.0
-            || rect.size.height <= 0.0
-        {
-            continue;
-        }
-        let Some(pid) = read_dict_int(w, kCGWindowOwnerPID) else {
-            continue;
-        };
-        let cached = lookup_or_query_pid(pid);
-        if !should_include_window(
-            layer,
-            alpha,
-            rect.size.width,
-            rect.size.height,
-            cached.as_ref(),
-        ) {
-            continue;
-        }
-        if let Some(cached) = cached {
-            let scroll = crate::mouse::resolve::resolve_scroll_for_app(Some(&cached.identity));
-            windows.push(WindowRect {
-                x0: rect.origin.x,
-                y0: rect.origin.y,
-                x1: rect.origin.x + rect.size.width,
-                y1: rect.origin.y + rect.size.height,
-                identity: cached.identity,
-                scroll,
-            });
-        }
-    }
-    CFRelease(list);
-    windows
 }
 
 fn ensure_snap_worker() {
@@ -492,37 +502,41 @@ unsafe fn seed_pid_map() {
 }
 
 unsafe fn read_dict_int(dict: *const c_void, key: *const c_void) -> Option<i32> {
-    let value = CFDictionaryGetValue(dict, key);
-    if value.is_null() {
-        return None;
-    }
-    let mut out: i32 = 0;
-    if CFNumberGetValue(value, K_CF_NUMBER_INT_TYPE, &mut out as *mut i32 as *mut c_void) {
-        Some(out)
-    } else {
-        None
+    unsafe {
+        let value = CFDictionaryGetValue(dict, key);
+        if value.is_null() {
+            return None;
+        }
+        let mut out: i32 = 0;
+        if CFNumberGetValue(value, K_CF_NUMBER_INT_TYPE, &mut out as *mut i32 as *mut c_void) {
+            Some(out)
+        } else {
+            None
+        }
     }
 }
 
 unsafe fn read_dict_f64(dict: *const c_void, key: *const c_void) -> Option<f64> {
-    let value = CFDictionaryGetValue(dict, key);
-    if value.is_null() {
-        return None;
-    }
-    let mut out: f64 = 0.0;
-    if CFNumberGetValue(
-        value,
-        K_CF_NUMBER_FLOAT64_TYPE,
-        &mut out as *mut f64 as *mut c_void,
-    ) {
-        Some(out)
-    } else {
-        None
+    unsafe {
+        let value = CFDictionaryGetValue(dict, key);
+        if value.is_null() {
+            return None;
+        }
+        let mut out: f64 = 0.0;
+        if CFNumberGetValue(
+            value,
+            K_CF_NUMBER_FLOAT64_TYPE,
+            &mut out as *mut f64 as *mut c_void,
+        ) {
+            Some(out)
+        } else {
+            None
+        }
     }
 }
 
 unsafe fn refresh_from_frontmost() -> AppIdentity {
-    identity_from_running_app(frontmost_application())
+    unsafe { identity_from_running_app(frontmost_application()) }
 }
 
 struct ObserverTarget(Mutex<Option<*mut AnyObject>>);
@@ -610,67 +624,69 @@ unsafe fn install_observer() {
         return;
     }
 
-    let class_name = CString::new("MouseControlAppObserver").unwrap();
-    let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
-    let cls = objc_allocateClassPair(superclass as *mut AnyObject, class_name.as_ptr(), 0);
-    if cls.is_null() {
-        log_info!("[app] failed to allocate observer class");
-        return;
-    }
-    let types = CString::new("v@:@").unwrap();
-    class_addMethod(
-        cls,
-        sel!(handleWorkspaceDidActivateApplication:),
-        handle_app_activation as *mut c_void,
-        types.as_ptr(),
-    );
-    class_addMethod(
-        cls,
-        sel!(handleWorkspaceDidLaunchApplication:),
-        handle_app_launch as *mut c_void,
-        types.as_ptr(),
-    );
-    class_addMethod(
-        cls,
-        sel!(handleWorkspaceDidTerminateApplication:),
-        handle_app_terminate as *mut c_void,
-        types.as_ptr(),
-    );
-    objc_registerClassPair(cls);
-
-    let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
-    if target.is_null() {
-        log_info!("[app] failed to create observer target");
-        return;
-    }
-    let _: *mut AnyObject = msg_send![target, retain];
-    *observer_target().lock().unwrap() = Some(target);
-
-    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-    let center: *mut AnyObject = msg_send![workspace, notificationCenter];
-    for (notif_name, selector) in [
-        (
-            "NSWorkspaceDidActivateApplicationNotification",
+    unsafe {
+        let class_name = CString::new("MouseControlAppObserver").unwrap();
+        let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
+        let cls = objc_allocateClassPair(superclass as *mut AnyObject, class_name.as_ptr(), 0);
+        if cls.is_null() {
+            log_info!("[app] failed to allocate observer class");
+            return;
+        }
+        let types = CString::new("v@:@").unwrap();
+        class_addMethod(
+            cls,
             sel!(handleWorkspaceDidActivateApplication:),
-        ),
-        (
-            "NSWorkspaceDidLaunchApplicationNotification",
+            handle_app_activation as *mut c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleWorkspaceDidLaunchApplication:),
-        ),
-        (
-            "NSWorkspaceDidTerminateApplicationNotification",
+            handle_app_launch as *mut c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleWorkspaceDidTerminateApplication:),
-        ),
-    ] {
-        let notification_name = make_nsstring(notif_name);
-        let _: () = msg_send![
-            center,
-            addObserver: target,
-            selector: selector,
-            name: notification_name,
-            object: std::ptr::null::<AnyObject>()
-        ];
-        CFRelease(notification_name as *const c_void);
+            handle_app_terminate as *mut c_void,
+            types.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+
+        let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
+        if target.is_null() {
+            log_info!("[app] failed to create observer target");
+            return;
+        }
+        let _: *mut AnyObject = msg_send![target, retain];
+        *observer_target().lock().unwrap() = Some(target);
+
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let center: *mut AnyObject = msg_send![workspace, notificationCenter];
+        for (notif_name, selector) in [
+            (
+                "NSWorkspaceDidActivateApplicationNotification",
+                sel!(handleWorkspaceDidActivateApplication:),
+            ),
+            (
+                "NSWorkspaceDidLaunchApplicationNotification",
+                sel!(handleWorkspaceDidLaunchApplication:),
+            ),
+            (
+                "NSWorkspaceDidTerminateApplicationNotification",
+                sel!(handleWorkspaceDidTerminateApplication:),
+            ),
+        ] {
+            let notification_name = make_nsstring(notif_name);
+            let _: () = msg_send![
+                center,
+                addObserver: target,
+                selector: selector,
+                name: notification_name,
+                object: std::ptr::null::<AnyObject>()
+            ];
+            CFRelease(notification_name as *const c_void);
+        }
     }
     log_info!("[app] active-app notification observer installed.");
 }

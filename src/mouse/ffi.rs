@@ -53,7 +53,7 @@ pub(crate) mod tap_options {
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn CGEventTapCreate(
         tap: i32,
         place: i32,
@@ -88,12 +88,12 @@ extern "C" {
 
 pub(crate) const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
 
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     pub(crate) fn CFMachPortCreateRunLoopSource(
         allocator: CFAllocatorRef,
         port: CFMachPortRef,
@@ -160,7 +160,7 @@ pub(crate) struct CGRectFFI {
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
 
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CGWindowListCopyWindowInfo(
@@ -176,7 +176,7 @@ extern "C" {
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
 
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CFDictionaryGetValue(
@@ -215,7 +215,7 @@ pub(crate) unsafe fn create_tap_with_retry(
     log_name: &str,
     cancel: Option<&'static std::sync::atomic::AtomicBool>,
 ) -> Option<CFMachPortRef> {
-    let mut tap = CGEventTapCreate(location, placement, options, mask, callback, user_info);
+    let mut tap = unsafe { CGEventTapCreate(location, placement, options, mask, callback, user_info) };
 
     if tap.is_null() {
         log_info!(
@@ -234,7 +234,9 @@ pub(crate) unsafe fn create_tap_with_retry(
                 return None;
             }
             if has_accessibility_permission() {
-                tap = CGEventTapCreate(location, placement, options, mask, callback, user_info);
+                tap = unsafe {
+                    CGEventTapCreate(location, placement, options, mask, callback, user_info)
+                };
                 if !tap.is_null() {
                     granted = true;
                     break;
@@ -262,7 +264,7 @@ pub(crate) unsafe fn create_tap_with_retry(
 }
 
 #[link(name = "IOKit", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
 
     pub(crate) fn IOHIDEventSystemClientCreate(allocator: *const c_void) -> *mut c_void;
     pub(crate) fn IOHIDEventSystemClientSetMatchingMultiple(
@@ -291,7 +293,7 @@ extern "C" {
 }
 
 #[link(name = "IOKit", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
 
     pub(crate) fn IOHIDEventGetSenderID(event: *mut c_void) -> u64;
 
@@ -302,7 +304,7 @@ pub(crate) const K_IOHID_EVENT_FIELD_BUTTON_MASK: u64 = 0x0005_0001;
 pub(crate) const K_IOHID_EVENT_FIELD_BUTTON_NUMBER: u64 = 0x0005_0002;
 
 #[link(name = "IOKit", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
 
     pub(crate) fn IOHIDManagerCreate(allocator: *const c_void, options: u32) -> *mut c_void;
     pub(crate) fn IOHIDManagerSetDeviceMatchingMultiple(
@@ -328,7 +330,7 @@ extern "C" {
 }
 
 #[link(name = "IOKit", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn IOHIDServiceClientGetRegistryID(client: *mut c_void) -> *const c_void;
 
@@ -349,25 +351,27 @@ pub(crate) unsafe fn service_registry_id(service: *mut c_void) -> Option<u64> {
     if service.is_null() {
         return None;
     }
-    let num = IOHIDServiceClientGetRegistryID(service);
-    if num.is_null() {
-        return None;
-    }
-    let mut id: u64 = 0;
-    if CFNumberGetValue(
-        num,
-        K_CF_NUMBER_SINT64_TYPE,
-        &mut id as *mut u64 as *mut c_void,
-    ) && id != 0
-    {
-        Some(id)
-    } else {
-        None
+    unsafe {
+        let num = IOHIDServiceClientGetRegistryID(service);
+        if num.is_null() {
+            return None;
+        }
+        let mut id: u64 = 0;
+        if CFNumberGetValue(
+            num,
+            K_CF_NUMBER_SINT64_TYPE,
+            &mut id as *mut u64 as *mut c_void,
+        ) && id != 0
+        {
+            Some(id)
+        } else {
+            None
+        }
     }
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
 
     pub(crate) fn CFArrayGetCount(the_array: *const c_void) -> isize;
 
@@ -509,7 +513,7 @@ pub(crate) struct NSPointFFI {
 
 #[link(name = "AppKit", kind = "framework")]
 #[allow(clashing_extern_declarations)]
-extern "C" {
+unsafe extern "C" {
 
     #[cfg_attr(test, allow(dead_code))]
     #[link_name = "objc_msgSend"]

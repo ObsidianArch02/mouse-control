@@ -150,33 +150,32 @@ impl Config {
 
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
-            if let Some(ref mode) = p.scroll_mode {
-                if !["default", "line", "pixel", "discrete", "continuous"].contains(&mode.as_str())
-                {
-                    errs.push(tf("errors.mouse_scroll_mode_invalid", &[("value", mode)]));
+            if let Some(ref mode) = p.scroll_mode
+                && !["default", "line", "pixel", "discrete", "continuous"].contains(&mode.as_str())
+            {
+                errs.push(tf("errors.mouse_scroll_mode_invalid", &[("value", mode)]));
 
-                    if let Some(last) = errs.last_mut() {
-                        *last = format!("{prefix}.scroll_mode: {last}");
-                    }
+                if let Some(last) = errs.last_mut() {
+                    *last = format!("{prefix}.scroll_mode: {last}");
                 }
             }
-            if let Some(lc) = p.line_count {
-                if !(1..=MAX_LINE_COUNT).contains(&lc) {
-                    let msg = tf(
-                        "errors.mouse_line_count_invalid",
-                        &[("value", &lc.to_string())],
-                    );
-                    errs.push(format!("{prefix}.line_count: {msg}"));
-                }
+            if let Some(lc) = p.line_count
+                && !(1..=MAX_LINE_COUNT).contains(&lc)
+            {
+                let msg = tf(
+                    "errors.mouse_line_count_invalid",
+                    &[("value", &lc.to_string())],
+                );
+                errs.push(format!("{prefix}.line_count: {msg}"));
             }
 
-            if let Some(lh) = p.line_height {
-                if !(1..=MAX_LINE_HEIGHT).contains(&lh) {
-                    errs.push(format!(
-                        "{prefix}.line_height: {} must be 1..={MAX_LINE_HEIGHT}",
-                        lh
-                    ));
-                }
+            if let Some(lh) = p.line_height
+                && !(1..=MAX_LINE_HEIGHT).contains(&lh)
+            {
+                errs.push(format!(
+                    "{prefix}.line_height: {} must be 1..={MAX_LINE_HEIGHT}",
+                    lh
+                ));
             }
 
             if let Some(ref map) = p.button_map {

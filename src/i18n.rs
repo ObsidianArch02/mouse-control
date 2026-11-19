@@ -106,10 +106,11 @@ pub fn apply_config_locale(locale_cfg: &str) {
 }
 
 fn resolve_locale(locale_cfg: Option<&str>) -> String {
-    if let Some(cfg) = locale_cfg {
-        if cfg != "auto" && is_supported(cfg) {
-            return cfg.to_string();
-        }
+    if let Some(cfg) = locale_cfg
+        && cfg != "auto"
+        && is_supported(cfg)
+    {
+        return cfg.to_string();
     }
 
     for tag in system_locales() {
@@ -163,7 +164,9 @@ unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
     if utf8.is_null() {
         return String::new();
     }
-    std::ffi::CStr::from_ptr(utf8)
-        .to_string_lossy()
-        .into_owned()
+    unsafe {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
+    }
 }

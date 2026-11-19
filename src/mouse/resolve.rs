@@ -182,10 +182,10 @@ fn profile_specificity(profile: &MouseProfile) -> u8 {
 pub(crate) fn resolve(device: Option<DeviceKey>, app: Option<AppIdentity>) -> Arc<ResolvedMouse> {
     let key = (device, app);
 
-    if let Ok(c) = CACHE.lock() {
-        if let Some(r) = c.get(&key) {
-            return Arc::clone(r);
-        }
+    if let Ok(c) = CACHE.lock()
+        && let Some(r) = c.get(&key)
+    {
+        return Arc::clone(r);
     }
 
     let r = {
@@ -231,10 +231,10 @@ fn resolve_from(
             if let Some(lh) = p.line_height {
                 r.line_height = Some(lh.clamp(1, crate::config::MAX_LINE_HEIGHT));
             }
-            if let Some(ref ptr) = p.pointer {
-                if let Some(da) = ptr.disable_acceleration {
-                    r.disable_acceleration = da;
-                }
+            if let Some(ref ptr) = p.pointer
+                && let Some(da) = ptr.disable_acceleration
+            {
+                r.disable_acceleration = da;
             }
 
             if let Some(ref map) = p.button_map {

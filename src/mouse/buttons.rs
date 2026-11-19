@@ -474,57 +474,61 @@ const MODIFIER_KEYCODES: [(CGEventFlags, u16); 4] = [
 
 #[cfg(not(test))]
 unsafe fn post_key_event(key: &PressedKey, down: bool, held_elsewhere: CGEventFlags) {
-    match key.action {
-        KeyAction::Keyboard { keycode } => {
-            let is_modifier_main = MODIFIER_KEYCODES.iter().any(|(_, vk)| *vk == keycode);
-            if down {
-                let mut held = held_elsewhere;
-                let mut pressed_any_modifier = false;
-                if !is_modifier_main {
-                    for (flag, vk) in MODIFIER_KEYCODES {
-                        if key.modifiers & flag != 0 && held & flag == 0 {
-                            post_modifier_key(vk, flag, true, held);
-                            held |= flag;
-                            pressed_any_modifier = true;
+    unsafe {
+        match key.action {
+            KeyAction::Keyboard { keycode } => {
+                let is_modifier_main = MODIFIER_KEYCODES.iter().any(|(_, vk)| *vk == keycode);
+                if down {
+                    let mut held = held_elsewhere;
+                    let mut pressed_any_modifier = false;
+                    if !is_modifier_main {
+                        for (flag, vk) in MODIFIER_KEYCODES {
+                            if key.modifiers & flag != 0 && held & flag == 0 {
+                                post_modifier_key(vk, flag, true, held);
+                                held |= flag;
+                                pressed_any_modifier = true;
+                            }
                         }
                     }
-                }
 
-                if pressed_any_modifier {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                post_simple_key(keycode, true, effective_flags(key));
-            } else {
-                post_simple_key(keycode, false, effective_flags(key));
-                if !is_modifier_main {
-                    let mut held = held_elsewhere | key.modifiers;
-                    for (flag, vk) in MODIFIER_KEYCODES {
-                        if key.modifiers & flag != 0 && held_elsewhere & flag == 0 {
-                            post_modifier_key(vk, flag, false, held);
-                            held &= !flag;
+                    if pressed_any_modifier {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    post_simple_key(keycode, true, effective_flags(key));
+                } else {
+                    post_simple_key(keycode, false, effective_flags(key));
+                    if !is_modifier_main {
+                        let mut held = held_elsewhere | key.modifiers;
+                        for (flag, vk) in MODIFIER_KEYCODES {
+                            if key.modifiers & flag != 0 && held_elsewhere & flag == 0 {
+                                post_modifier_key(vk, flag, false, held);
+                                held &= !flag;
+                            }
                         }
                     }
                 }
             }
-        }
-        KeyAction::Media { nx_key } => {
-            post_media_event(nx_key, down);
+            KeyAction::Media { nx_key } => {
+                post_media_event(nx_key, down);
+            }
         }
     }
 }
 
 #[cfg(not(test))]
 unsafe fn post_simple_key(keycode: u16, down: bool, flags: CGEventFlags) {
-    let ev = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, if down { 1 } else { 0 });
-    if ev.is_null() {
-        log_debug!("[buttons] failed to synthesize keyboard event");
-        return;
-    }
+    unsafe {
+        let ev = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, if down { 1 } else { 0 });
+        if ev.is_null() {
+            log_debug!("[buttons] failed to synthesize keyboard event");
+            return;
+        }
 
-    let inherited = CGEventGetFlags(ev) & !MODIFIER_FLAG_MASK;
-    CGEventSetFlags(ev, inherited | flags);
-    CGEventPost(K_CG_HID_EVENT_TAP, ev);
-    crate::ffi::CFRelease(ev as *const std::ffi::c_void);
+        let inherited = CGEventGetFlags(ev) & !MODIFIER_FLAG_MASK;
+        CGEventSetFlags(ev, inherited | flags);
+        CGEventPost(K_CG_HID_EVENT_TAP, ev);
+        crate::ffi::CFRelease(ev as *const std::ffi::c_void);
+    }
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -536,7 +540,7 @@ const MODIFIER_FLAG_MASK: CGEventFlags = K_CG_EVENT_FLAG_MASK_COMMAND
 #[cfg(not(test))]
 unsafe fn post_modifier_key(vk: u16, flag: CGEventFlags, down: bool, held: CGEventFlags) {
     let flags = if down { held | flag } else { held & !flag };
-    post_simple_key(vk, down, flags);
+    unsafe { post_simple_key(vk, down, flags) };
 }
 
 fn effective_flags(key: &PressedKey) -> CGEventFlags {
@@ -559,29 +563,31 @@ unsafe fn post_media_event(nx_key: i32, down: bool) {
     let state: isize = if down { 0xa } else { 0xb };
     let data1: isize = ((nx_key as isize) << 16) | (state << 8);
     let modifier_flags: u64 = if down { 0xa00 } else { 0xb00 };
-    let event = ffi::objc_msgSend_create_system_event(
-        class!(NSEvent) as *const objc2::runtime::AnyClass as *mut AnyObject,
-        sel!(otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:),
-        14,
-        ffi::NSPointFFI { x: 0.0, y: 0.0 },
-        modifier_flags,
-        0.0,
-        0,
-        std::ptr::null_mut(),
-        8,
-        data1,
-        -1,
-    );
-    if event.is_null() {
-        log_debug!("[buttons] failed to synthesize NSSystemDefined event");
-        return;
+    unsafe {
+        let event = ffi::objc_msgSend_create_system_event(
+            class!(NSEvent) as *const objc2::runtime::AnyClass as *mut AnyObject,
+            sel!(otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:),
+            14,
+            ffi::NSPointFFI { x: 0.0, y: 0.0 },
+            modifier_flags,
+            0.0,
+            0,
+            std::ptr::null_mut(),
+            8,
+            data1,
+            -1,
+        );
+        if event.is_null() {
+            log_debug!("[buttons] failed to synthesize NSSystemDefined event");
+            return;
+        }
+        ffi::objc_msgSend_retain(event, sel!(retain));
+        let cg_event = ffi::objc_msgSend_cgevent(event, sel!(CGEvent));
+        if !cg_event.is_null() {
+            CGEventPost(K_CG_HID_EVENT_TAP, cg_event);
+        }
+        ffi::objc_msgSend_release(event, sel!(release));
     }
-    ffi::objc_msgSend_retain(event, sel!(retain));
-    let cg_event = ffi::objc_msgSend_cgevent(event, sel!(CGEvent));
-    if !cg_event.is_null() {
-        CGEventPost(K_CG_HID_EVENT_TAP, cg_event);
-    }
-    ffi::objc_msgSend_release(event, sel!(release));
 }
 
 #[cfg(test)]

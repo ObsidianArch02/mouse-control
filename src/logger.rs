@@ -95,7 +95,7 @@ fn write_log_entry(
     if is_dev {
         print!("{}", msg);
     }
-    if let Some(ref mut f) = file {
+    if let Some(f) = file {
         let _ = f.write_all(msg.as_bytes());
     }
     *count += 1;
@@ -185,12 +185,11 @@ fn cleanup_old_logs(dir: &str) {
         if !name.starts_with("mouse-control-") || !name.ends_with(".log") {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(mtime) = meta.modified() {
-                if mtime < cutoff {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(mtime) = meta.modified()
+            && mtime < cutoff
+        {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -212,7 +211,7 @@ struct Tm {
     tm_zone: *const i8,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn localtime_r(time: *const TimeT, result: *mut Tm) -> *mut Tm;
 }
 

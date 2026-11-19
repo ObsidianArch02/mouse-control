@@ -11,7 +11,7 @@ enabled = true
 [[mouse.profiles]]
 reverse_scroll = true
 scroll_mode = "pixel"
-line_count = 3
+line_count = 4
 
 [mouse.profiles.button_map]
 3 = "ctrl+right"
@@ -20,8 +20,3 @@ line_count = 3
 [[mouse.profiles]]
 app_bundle_id = "com.apple.ScreenContinuity"
 scroll_mode = "continuous"
-
-[[mouse.profiles]]
-app_bundle_id = "com.apple.Notes"
-line_count = 2
-line_height = 24

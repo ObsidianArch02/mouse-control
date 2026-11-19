@@ -4,7 +4,7 @@ use std::process::Command;
 
 const LABEL: &str = "com.eacryo.mouse-control";
 
-extern "C" {
+unsafe extern "C" {
     fn getuid() -> u32;
 }
 
@@ -134,16 +134,16 @@ fn cmd_uninstall() -> i32 {
         println!("{}", t("service.agent_not_loaded"));
     }
     let plist = plist_path();
-    if plist.exists() {
-        if let Err(e) = std::fs::remove_file(&plist) {
-            return fail("remove plist", &e.to_string());
-        }
+    if plist.exists()
+        && let Err(e) = std::fs::remove_file(&plist)
+    {
+        return fail("remove plist", &e.to_string());
     }
     let bin = installed_binary();
-    if bin.exists() {
-        if let Err(e) = std::fs::remove_file(&bin) {
-            return fail("remove binary", &e.to_string());
-        }
+    if bin.exists()
+        && let Err(e) = std::fs::remove_file(&bin)
+    {
+        return fail("remove binary", &e.to_string());
     }
     println!("{}", tf("service.uninstall_done", &[("label", LABEL)]));
     let log = display(&log_dir());
@@ -212,10 +212,10 @@ fn cmd_status() -> i32 {
         None => println!("{}", t("service.status_not_loaded")),
     }
 
-    if bin.exists() {
-        if let Some(req) = designated_requirement(&bin) {
-            println!("{}", tf("service.status_requirement", &[("req", &req)]));
-        }
+    if bin.exists()
+        && let Some(req) = designated_requirement(&bin)
+    {
+        println!("{}", tf("service.status_requirement", &[("req", &req)]));
     }
     0
 }
