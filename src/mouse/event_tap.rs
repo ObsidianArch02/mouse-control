@@ -446,62 +446,65 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
 
     STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
 
-    thread::spawn(move || unsafe {
-        let rl = CFRunLoopGetCurrent();
-        device::start_plug_monitor(rl);
-        device::ensure_enumerated();
+    thread::Builder::new()
+        .name("mouse-tap".into())
+        .spawn(move || unsafe {
+            let rl = CFRunLoopGetCurrent();
+            device::start_plug_monitor();
+            device::ensure_enumerated();
 
-        let tap = ffi::create_tap_with_retry(
-            tap_location::HID_EVENT_TAP,
-            tap_placement::HEAD_INSERT,
-            tap_options::DEFAULT_TAP,
-            mask,
-            Some(mouse_event_tap_callback),
-            std::ptr::null_mut(),
-            "mouse",
-            Some(&STOP_REQUESTED),
-        );
+            let tap = ffi::create_tap_with_retry(
+                tap_location::HID_EVENT_TAP,
+                tap_placement::HEAD_INSERT,
+                tap_options::DEFAULT_TAP,
+                mask,
+                Some(mouse_event_tap_callback),
+                std::ptr::null_mut(),
+                "mouse",
+                Some(&STOP_REQUESTED),
+            );
 
-        let tap = match tap {
-            Some(t) => t,
-            None => {
-                device::detach_plug_monitor(rl);
-                return;
+            let tap = match tap {
+                Some(t) => t,
+                None => {
+                    device::detach_plug_monitor();
+                    return;
+                }
+            };
+
+            let source = ffi::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
+            if !source.is_null() {
+                ffi::CFRunLoopAddSource(rl, source, ffi::kCFRunLoopDefaultMode);
             }
-        };
+            CURRENT_TAP.with(|c| c.set(tap));
+            ffi::CGEventTapEnable(tap, true);
 
-        let source = ffi::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
-        if !source.is_null() {
-            ffi::CFRunLoopAddSource(rl, source, ffi::kCFRunLoopDefaultMode);
-        }
-        CURRENT_TAP.with(|c| c.set(tap));
-        ffi::CGEventTapEnable(tap, true);
-
-        // 存入 RunLoop 供 stop() 使用;存入后再查一次停止标志,消除"存入后、run 前置位
-        // 标志"的竞态窗口(stop() 读 RUNLOOP 时要么读到 Some 而 CFRunLoopStop 有效,
-        // 要么读到 None 而线程的检查会拦截)。
-        // Store the RunLoop for stop(); re-check the stop flag after storing to close the race
-        // where the flag is set between the store and the run (stop() either reads Some and
-        // CFRunLoopStop works, or reads None and the thread's check catches it).
-        crate::ffi::CFRetain(rl as *const c_void);
-        *runloop_static().lock().unwrap() = Some(rl);
-        if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
-            log_info!("Mouse event tap started.");
-            // 阻塞运行 RunLoop,直到 stop() 触发 CFRunLoopStop 或线程被终止。
-            // Block on the RunLoop until stop() fires CFRunLoopStop or the thread is killed.
-            ffi::CFRunLoopRun();
-        }
-        if let Some(r) = runloop_static().lock().unwrap().take() {
-            CFRelease(r as *const c_void);
-        }
-        device::detach_plug_monitor(rl);
-        CURRENT_TAP.with(|c| c.set(std::ptr::null_mut()));
-        ffi::CGEventTapEnable(tap, false);
-        if !source.is_null() {
-            ffi::CFRunLoopRemoveSource(rl, source, ffi::kCFRunLoopDefaultMode);
-            CFRelease(source as *const c_void);
-        }
-        ffi::CFMachPortInvalidate(tap);
-        CFRelease(tap as *const c_void);
-    })
+            // 存入 RunLoop 供 stop() 使用;存入后再查一次停止标志,消除"存入后、run 前置位
+            // 标志"的竞态窗口(stop() 读 RUNLOOP 时要么读到 Some 而 CFRunLoopStop 有效,
+            // 要么读到 None 而线程的检查会拦截)。
+            // Store the RunLoop for stop(); re-check the stop flag after storing to close the race
+            // where the flag is set between the store and the run (stop() either reads Some and
+            // CFRunLoopStop works, or reads None and the thread's check catches it).
+            crate::ffi::CFRetain(rl as *const c_void);
+            *runloop_static().lock().unwrap() = Some(rl);
+            if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                log_info!("Mouse event tap started.");
+                // 阻塞运行 RunLoop,直到 stop() 触发 CFRunLoopStop 或线程被终止。
+                // Block on the RunLoop until stop() fires CFRunLoopStop or the thread is killed.
+                ffi::CFRunLoopRun();
+            }
+            if let Some(r) = runloop_static().lock().unwrap().take() {
+                CFRelease(r as *const c_void);
+            }
+            device::detach_plug_monitor();
+            CURRENT_TAP.with(|c| c.set(std::ptr::null_mut()));
+            ffi::CGEventTapEnable(tap, false);
+            if !source.is_null() {
+                ffi::CFRunLoopRemoveSource(rl, source, ffi::kCFRunLoopDefaultMode);
+                CFRelease(source as *const c_void);
+            }
+            ffi::CFMachPortInvalidate(tap);
+            CFRelease(tap as *const c_void);
+        })
+        .expect("failed to spawn mouse-tap thread")
 }

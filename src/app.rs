@@ -12,10 +12,11 @@ use crate::ffi::{
     objc_registerClassPair, CFRelease,
 };
 use crate::mouse::ffi::{
-    kCGWindowLayer, kCGWindowOwnerPID, objc_msgSend_window_number_at_point, CFArrayGetCount,
-    CFArrayGetValueAtIndex, CFDictionaryGetValue, CFNumberGetValue, CGDisplayBounds,
-    CGMainDisplayID, CGWindowListCopyWindowInfo, NSPointFFI, K_CF_NUMBER_INT_TYPE,
-    K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW,
+    kCGWindowAlpha, kCGWindowBounds, kCGWindowLayer, kCGWindowOwnerPID, CFArrayGetCount,
+    CFArrayGetValueAtIndex, CFDictionaryGetValue, CFNumberGetValue, CGRectFFI,
+    CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, K_CF_NUMBER_FLOAT64_TYPE,
+    K_CF_NUMBER_INT_TYPE, K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+    K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY,
 };
 use crate::{log_debug, log_info};
 use objc2::rc::autoreleasepool;
@@ -24,14 +25,13 @@ use objc2::{class, msg_send, sel};
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const ACTIVATION_POLICY_PROHIBITED: isize = 2;
-const WIN_META_CACHE_MAX: usize = 512;
-const HIT_CACHE_TTL: Duration = Duration::from_millis(40);
-const HIT_CACHE_RADIUS_PX: f64 = 4.0;
-const MAX_HIT_WALK_DEPTH: usize = 6;
+const PID_MAP_MAX: usize = 512;
+const MAX_WINDOW_LAYER: i32 = 20;
+const WINDOW_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 
 /// 当前前台 app 的稳定身份。字段来自 NSRunningApplication;无 bundle 的小工具/脚本只有
 /// localized_name,两者都缺失时 per-app 档只会命中无 app 字段的全局/设备档。
@@ -50,35 +50,36 @@ struct CachedApp {
     activation_policy: isize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HitDecision {
-    Accept,
-    SkipBelow,
-    FallbackActive,
+#[derive(Debug, Clone)]
+struct WindowRect {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    identity: AppIdentity,
+}
+
+struct WindowSnapshot {
+    windows: Vec<WindowRect>,
+    epoch: u64,
+    updated_at: Option<Instant>,
 }
 
 static ACTIVE_APP: Mutex<Option<AppIdentity>> = Mutex::new(None);
 static PID_MAP: std::sync::LazyLock<Mutex<HashMap<i32, CachedApp>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-static WIN_META_CACHE: std::sync::LazyLock<Mutex<HashMap<u32, (i32, i32)>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static APP_EPOCH: AtomicU64 = AtomicU64::new(1);
-
-struct HitCache {
-    x: f64,
-    y: f64,
-    epoch: u64,
-    updated_at: Option<Instant>,
-    result: Option<AppIdentity>,
-}
-
-static HIT_CACHE: Mutex<HitCache> = Mutex::new(HitCache {
-    x: 0.0,
-    y: 0.0,
-    epoch: 0,
-    updated_at: None,
-    result: None,
-});
+static WINDOW_SNAPSHOT: std::sync::LazyLock<Mutex<WindowSnapshot>> =
+    std::sync::LazyLock::new(|| {
+        Mutex::new(WindowSnapshot {
+            windows: Vec::new(),
+            epoch: 0,
+            updated_at: None,
+        })
+    });
+static SNAP_SIGNAL: Mutex<bool> = Mutex::new(false);
+static SNAP_CV: Condvar = Condvar::new();
+static SNAP_WORKER: OnceLock<()> = OnceLock::new();
 
 /// 返回当前缓存的 app 身份。供鼠标线程 resolve 使用,只读 Mutex,不调用 AppKit。
 /// Return the cached app identity. Used by the mouse thread for resolution; read-only Mutex,
@@ -160,27 +161,64 @@ unsafe fn cached_app_from_running_app(app: *mut AnyObject) -> CachedApp {
     }
 }
 
-fn classify_hit_candidate(layer: i32, app: Option<&CachedApp>) -> HitDecision {
-    // 桌面层(layer < 0)不触发窗口归因,交由调用方按当前前台 app 兜底。
-    // Desktop windows (layer < 0) do not override attribution; fall back to frontmost app.
-    if layer < 0 {
-        return HitDecision::FallbackActive;
+fn should_include_window(
+    layer: i32,
+    alpha: f64,
+    width: f64,
+    height: f64,
+    app: Option<&CachedApp>,
+) -> bool {
+    // 排除桌面层(layer < 0)与 Dock/MenuBar 及以上系统层(layer >= 20),保留普通窗口与浮层。
+    // Exclude desktop windows (layer < 0) and Dock/MenuBar system layers (layer >= 20), keeping
+    // normal windows and popovers.
+    if !(0..MAX_WINDOW_LAYER).contains(&layer) {
+        return false;
+    }
+    if !alpha.is_finite() || alpha <= 0.0 {
+        return false;
+    }
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return false;
     }
     let Some(app) = app else {
-        return HitDecision::FallbackActive;
+        return false;
     };
-    // 无界面后台/虚拟叠层(如 policy=2 的全屏透明驱动窗口)向下穿透继续查找真实宿主窗口。
-    // Skip prohibited background processes (e.g., policy=2 fullscreen helper overlays) to inspect windows below.
+    // 跳过无界面后台/虚拟叠层(如 policy=2 的全屏透明驱动窗口)与 Dock。
+    // Skip prohibited background helpers (e.g., policy=2 fullscreen driver overlays) and Dock.
     if app.activation_policy == ACTIVATION_POLICY_PROHIBITED {
-        return HitDecision::SkipBelow;
+        return false;
     }
     if app.identity.bundle_id.as_deref() == Some("com.apple.dock") {
-        return HitDecision::FallbackActive;
+        return false;
     }
     if app.identity.bundle_id.is_none() && app.identity.localized_name.is_none() {
-        return HitDecision::FallbackActive;
+        return false;
     }
-    HitDecision::Accept
+    true
+}
+
+fn lookup_window_identity(
+    snap: &WindowSnapshot,
+    current_epoch: u64,
+    x: f64,
+    y: f64,
+    now: Instant,
+) -> (Option<AppIdentity>, bool) {
+    // 切窗后快照代际滞后时直接返回 None,让调用方回退到已同步更新的前台 app,并触发刷新。
+    // When snapshot epoch lags behind the latest switch, return None so the caller falls back
+    // immediately to the updated frontmost app while triggering an async refresh.
+    if snap.epoch != current_epoch {
+        return (None, true);
+    }
+    let hit = snap
+        .windows
+        .iter()
+        .find(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
+        .map(|r| r.identity.clone());
+    let needs_refresh = snap
+        .updated_at
+        .is_none_or(|t| now.saturating_duration_since(t) >= WINDOW_SNAPSHOT_TTL);
+    (hit, needs_refresh)
 }
 
 unsafe fn lookup_or_query_pid(pid: i32) -> Option<CachedApp> {
@@ -196,9 +234,9 @@ unsafe fn lookup_or_query_pid(pid: i32) -> Option<CachedApp> {
     ];
     let entry = cached_app_from_running_app(app);
     let mut map = PID_MAP.lock().unwrap();
-    if map.len() >= WIN_META_CACHE_MAX && !map.contains_key(&pid) {
+    if map.len() >= PID_MAP_MAX && !map.contains_key(&pid) {
         map.retain(|_, v| v.activation_policy != ACTIVATION_POLICY_PROHIBITED);
-        if map.len() >= WIN_META_CACHE_MAX {
+        if map.len() >= PID_MAP_MAX {
             map.clear();
         }
     }
@@ -206,102 +244,130 @@ unsafe fn lookup_or_query_pid(pid: i32) -> Option<CachedApp> {
     Some(entry)
 }
 
-unsafe fn window_owner_and_layer(wn: u32) -> Option<(i32, i32)> {
-    if let Some(hit) = WIN_META_CACHE.lock().unwrap().get(&wn).copied() {
-        return Some(hit);
-    }
-    let list = CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW, wn);
+unsafe fn capture_window_rects() -> Vec<WindowRect> {
+    let list = CGWindowListCopyWindowInfo(
+        K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+        0,
+    );
     if list.is_null() {
-        return None;
+        return Vec::new();
     }
-    let meta = if CFArrayGetCount(list) > 0 {
-        let w = CFArrayGetValueAtIndex(list, 0);
+    let count = CFArrayGetCount(list);
+    let mut windows = Vec::with_capacity(count.max(0) as usize);
+    for i in 0..count {
+        let w = CFArrayGetValueAtIndex(list, i);
         if w.is_null() {
-            None
-        } else {
-            match (
-                read_dict_int(w, kCGWindowOwnerPID),
-                read_dict_int(w, kCGWindowLayer),
-            ) {
-                (Some(pid), Some(layer)) => Some((pid, layer)),
-                _ => None,
-            }
+            continue;
         }
-    } else {
-        None
-    };
-    CFRelease(list);
-    if let Some(v) = meta {
-        let mut cache = WIN_META_CACHE.lock().unwrap();
-        if cache.len() >= WIN_META_CACHE_MAX && !cache.contains_key(&wn) {
-            cache.clear();
+        let Some(layer) = read_dict_int(w, kCGWindowLayer) else {
+            continue;
+        };
+        if !(0..MAX_WINDOW_LAYER).contains(&layer) {
+            continue;
         }
-        cache.insert(wn, v);
+        let alpha = read_dict_f64(w, kCGWindowAlpha).unwrap_or(1.0);
+        if !alpha.is_finite() || alpha <= 0.0 {
+            continue;
+        }
+        let bounds_dict = CFDictionaryGetValue(w, kCGWindowBounds);
+        if bounds_dict.is_null() {
+            continue;
+        }
+        let mut rect = CGRectFFI::default();
+        if !CGRectMakeWithDictionaryRepresentation(bounds_dict, &mut rect) {
+            continue;
+        }
+        if !rect.origin.x.is_finite()
+            || !rect.origin.y.is_finite()
+            || !rect.size.width.is_finite()
+            || !rect.size.height.is_finite()
+            || rect.size.width <= 0.0
+            || rect.size.height <= 0.0
+        {
+            continue;
+        }
+        let Some(pid) = read_dict_int(w, kCGWindowOwnerPID) else {
+            continue;
+        };
+        let cached = lookup_or_query_pid(pid);
+        if !should_include_window(
+            layer,
+            alpha,
+            rect.size.width,
+            rect.size.height,
+            cached.as_ref(),
+        ) {
+            continue;
+        }
+        if let Some(cached) = cached {
+            windows.push(WindowRect {
+                x0: rect.origin.x,
+                y0: rect.origin.y,
+                x1: rect.origin.x + rect.size.width,
+                y1: rect.origin.y + rect.size.height,
+                identity: cached.identity,
+            });
+        }
     }
-    meta
+    CFRelease(list);
+    windows
 }
 
-/// 光标坐标处的 app 身份:实时请求 WindowServer 做单点窗口命中测试,自动跳过透明穿透层
-/// 及后台覆盖层(如 policy=2 的虚拟显示驱动),无 200ms 切窗滞后。
-///
-/// App identity at cursor coordinates: perform live WindowServer hit-testing, skipping
-/// click-through and background overlay processes without stale snapshot lag.
-pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
-    let epoch = APP_EPOCH.load(Ordering::Acquire);
-    {
-        let c = HIT_CACHE.lock().unwrap();
-        if c.epoch == epoch
-            && c.updated_at.is_some_and(|t| t.elapsed() < HIT_CACHE_TTL)
-            && (x - c.x).abs() <= HIT_CACHE_RADIUS_PX
-            && (y - c.y).abs() <= HIT_CACHE_RADIUS_PX
-        {
-            return c.result.clone();
-        }
-    }
+fn ensure_snap_worker() {
+    SNAP_WORKER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("window-snap".into())
+            .spawn(|| loop {
+                let mut pending = SNAP_SIGNAL.lock().unwrap();
+                while !*pending {
+                    pending = SNAP_CV.wait(pending).unwrap();
+                }
+                *pending = false;
+                drop(pending);
 
-    let result = autoreleasepool(|_| unsafe {
-        let main_h = CGDisplayBounds(CGMainDisplayID()).size.height;
-        let ns_pt = NSPointFFI { x, y: main_h - y };
-        let ns_win_cls = class!(NSWindow) as *const _ as *mut AnyObject;
-        let mut below: isize = 0;
-        let mut resolved = None;
-        for _ in 0..MAX_HIT_WALK_DEPTH {
-            let wn = objc_msgSend_window_number_at_point(
-                ns_win_cls,
-                sel!(windowNumberAtPoint:belowWindowWithWindowNumber:),
-                ns_pt,
-                below,
-            );
-            if wn <= 0 {
-                break;
-            }
-            let Some((pid, layer)) = window_owner_and_layer(wn as u32) else {
-                break;
-            };
-            let cached = lookup_or_query_pid(pid);
-            match classify_hit_candidate(layer, cached.as_ref()) {
-                HitDecision::Accept => {
-                    resolved = cached.map(|c| c.identity);
-                    break;
+                loop {
+                    let target_epoch = APP_EPOCH.load(Ordering::Acquire);
+                    let windows = autoreleasepool(|_| unsafe { capture_window_rects() });
+                    {
+                        let mut snap = WINDOW_SNAPSHOT.lock().unwrap();
+                        snap.windows = windows;
+                        snap.epoch = target_epoch;
+                        snap.updated_at = Some(Instant::now());
+                    }
+                    if APP_EPOCH.load(Ordering::Acquire) == target_epoch {
+                        break;
+                    }
                 }
-                HitDecision::SkipBelow => {
-                    below = wn;
-                }
-                HitDecision::FallbackActive => {
-                    break;
-                }
-            }
-        }
-        resolved
+            })
+            .expect("failed to spawn window-snap worker thread");
     });
+}
 
-    let mut c = HIT_CACHE.lock().unwrap();
-    c.x = x;
-    c.y = y;
-    c.epoch = epoch;
-    c.updated_at = Some(Instant::now());
-    c.result = result.clone();
-    result
+fn request_snapshot_refresh() {
+    ensure_snap_worker();
+    let mut pending = SNAP_SIGNAL.lock().unwrap();
+    if !*pending {
+        *pending = true;
+        SNAP_CV.notify_one();
+    }
+}
+
+/// 光标坐标处的 app 身份:只读内存窗口快照,不在 event tap 线程发起任何 AppKit/SkyLight IPC;
+/// 快照代际滞后或过期时仅唤醒后台 window-snap 线程异步刷新。
+///
+/// App identity at cursor coordinates: reads only the in-memory window snapshot with zero
+/// AppKit or SkyLight IPC on the event-tap thread, waking the background window-snap worker
+/// asynchronously when the snapshot epoch lags or TTL expires.
+pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
+    let current_epoch = APP_EPOCH.load(Ordering::Acquire);
+    let (hit, needs_refresh) = {
+        let snap = WINDOW_SNAPSHOT.lock().unwrap();
+        lookup_window_identity(&snap, current_epoch, x, y, Instant::now())
+    };
+    if needs_refresh {
+        request_snapshot_refresh();
+    }
+    hit
 }
 
 unsafe fn seed_pid_map() {
@@ -340,6 +406,25 @@ unsafe fn read_dict_int(dict: *const c_void, key: *const c_void) -> Option<i32> 
     }
     let mut out: i32 = 0;
     if CFNumberGetValue(value, K_CF_NUMBER_INT_TYPE, &mut out as *mut i32 as *mut c_void) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 从窗口 CFDictionary 读 f64 值(kCGWindowAlpha 是 CFNumber)。
+/// Read an f64 value from a window CFDictionary (kCGWindowAlpha is a CFNumber).
+unsafe fn read_dict_f64(dict: *const c_void, key: *const c_void) -> Option<f64> {
+    let value = CFDictionaryGetValue(dict, key);
+    if value.is_null() {
+        return None;
+    }
+    let mut out: f64 = 0.0;
+    if CFNumberGetValue(
+        value,
+        K_CF_NUMBER_FLOAT64_TYPE,
+        &mut out as *mut f64 as *mut c_void,
+    ) {
         Some(out)
     } else {
         None
@@ -390,6 +475,7 @@ extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, notification:
         PID_MAP.lock().unwrap().insert(pid, cached);
     }
     APP_EPOCH.fetch_add(1, Ordering::Release);
+    request_snapshot_refresh();
     if !set_active(identity) {
         return;
     }
@@ -423,6 +509,7 @@ extern "C" fn handle_app_launch(_self: *mut c_void, _cmd: Sel, notification: *mu
         PID_MAP.lock().unwrap().insert(pid, cached);
     }
     APP_EPOCH.fetch_add(1, Ordering::Release);
+    request_snapshot_refresh();
 }
 
 extern "C" fn handle_app_terminate(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
@@ -436,12 +523,9 @@ extern "C" fn handle_app_terminate(_self: *mut c_void, _cmd: Sel, notification: 
     };
     if term_pid > 0 {
         PID_MAP.lock().unwrap().remove(&term_pid);
-        WIN_META_CACHE
-            .lock()
-            .unwrap()
-            .retain(|_, (owner, _)| *owner != term_pid);
     }
     APP_EPOCH.fetch_add(1, Ordering::Release);
+    request_snapshot_refresh();
 }
 
 unsafe fn install_observer() {
@@ -529,6 +613,7 @@ pub(crate) fn start_monitor() {
         set_active(initial);
         install_observer();
     }
+    request_snapshot_refresh();
     log_debug!("[app] active-app monitor started: {:?}", active_identity());
 }
 
@@ -547,36 +632,92 @@ mod tests {
     }
 
     #[test]
-    fn hit_classifier_skips_prohibited_overlays_and_accepts_gui_and_popovers() {
+    fn window_filter_excludes_overlays_dock_transparent_and_empty_bounds() {
         let cua = cached(Some("com.trycua.driver"), Some("Cua Driver"), 2);
-        assert_eq!(
-            classify_hit_candidate(0, Some(&cua)),
-            HitDecision::SkipBelow
-        );
+        assert!(!should_include_window(0, 1.0, 2752.0, 1152.0, Some(&cua)));
 
         let ghostty = cached(Some("com.mitchellh.ghostty"), Some("Ghostty"), 0);
-        assert_eq!(
-            classify_hit_candidate(0, Some(&ghostty)),
-            HitDecision::Accept
-        );
+        assert!(should_include_window(0, 1.0, 1200.0, 800.0, Some(&ghostty)));
+        assert!(!should_include_window(
+            0,
+            0.0,
+            1200.0,
+            800.0,
+            Some(&ghostty)
+        ));
+        assert!(!should_include_window(0, 1.0, 0.0, 0.0, Some(&ghostty)));
+        assert!(!should_include_window(
+            -2_147_483_603,
+            1.0,
+            1200.0,
+            800.0,
+            Some(&ghostty)
+        ));
 
         let popover = cached(Some("com.mowglii.ItsycalApp"), Some("Itsycal"), 1);
-        assert_eq!(
-            classify_hit_candidate(3, Some(&popover)),
-            HitDecision::Accept
-        );
+        assert!(should_include_window(3, 1.0, 320.0, 400.0, Some(&popover)));
 
         let dock = cached(Some("com.apple.dock"), Some("Dock"), 1);
-        assert_eq!(
-            classify_hit_candidate(20, Some(&dock)),
-            HitDecision::FallbackActive
-        );
+        assert!(!should_include_window(20, 1.0, 2752.0, 1152.0, Some(&dock)));
+        assert!(!should_include_window(0, 1.0, 2752.0, 1152.0, Some(&dock)));
+
+        let unnamed = cached(None, None, 0);
+        assert!(!should_include_window(0, 1.0, 400.0, 300.0, Some(&unnamed)));
+        assert!(!should_include_window(0, 1.0, 400.0, 300.0, None));
+    }
+
+    #[test]
+    fn lookup_window_identity_respects_epoch_z_order_and_ttl() {
+        let now = Instant::now();
+        let front = AppIdentity {
+            bundle_id: Some("com.mitchellh.ghostty".to_string()),
+            localized_name: Some("Ghostty".to_string()),
+        };
+        let back = AppIdentity {
+            bundle_id: Some("net.imput.helium".to_string()),
+            localized_name: Some("Helium".to_string()),
+        };
+        let snap = WindowSnapshot {
+            windows: vec![
+                WindowRect {
+                    x0: 100.0,
+                    y0: 100.0,
+                    x1: 500.0,
+                    y1: 500.0,
+                    identity: front.clone(),
+                },
+                WindowRect {
+                    x0: 0.0,
+                    y0: 0.0,
+                    x1: 1000.0,
+                    y1: 1000.0,
+                    identity: back.clone(),
+                },
+            ],
+            epoch: 3,
+            updated_at: Some(now),
+        };
 
         assert_eq!(
-            classify_hit_candidate(-2_147_483_603, Some(&ghostty)),
-            HitDecision::FallbackActive
+            lookup_window_identity(&snap, 4, 200.0, 200.0, now),
+            (None, true)
         );
-        assert_eq!(classify_hit_candidate(0, None), HitDecision::FallbackActive);
+        assert_eq!(
+            lookup_window_identity(&snap, 3, 200.0, 200.0, now),
+            (Some(front), false)
+        );
+        assert_eq!(
+            lookup_window_identity(&snap, 3, 50.0, 50.0, now),
+            (Some(back.clone()), false)
+        );
+        assert_eq!(
+            lookup_window_identity(&snap, 3, 1200.0, 1200.0, now),
+            (None, false)
+        );
+        assert_eq!(
+            lookup_window_identity(&snap, 3, 50.0, 50.0, now + WINDOW_SNAPSHOT_TTL),
+            (Some(back), true)
+        );
     }
 
     #[test]

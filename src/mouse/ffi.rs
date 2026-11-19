@@ -188,15 +188,11 @@ pub(crate) const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: CGEventType = 0xFFFF_FFF
 
 /// CGWindowListCopyWindowInfo 选项:只取屏幕上的窗口。
 /// CGWindowListCopyWindowInfo option: on-screen windows only.
-#[allow(dead_code)]
-pub(crate) const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
-/// CGWindowListCopyWindowInfo 选项:仅返回 relativeToWindow 指定的单个窗口。
-/// CGWindowListCopyWindowInfo option: include only the single window specified by relativeToWindow.
 #[cfg_attr(test, allow(dead_code))]
-pub(crate) const K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
+pub(crate) const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
 /// CGWindowListCopyWindowInfo 选项:排除桌面元素(桌面图标窗口)。
 /// CGWindowListCopyWindowInfo option: exclude desktop elements (desktop icon windows).
-#[allow(dead_code)]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
 
 #[cfg_attr(test, allow(dead_code))]
@@ -206,6 +202,8 @@ pub(crate) const K_CF_NUMBER_SINT64_TYPE: isize = 4;
 /// CFNumberType kCFNumberIntType = 9 (an enum constant, not an exported symbol; raw value).
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const K_CF_NUMBER_INT_TYPE: isize = 9;
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const K_CF_NUMBER_FLOAT64_TYPE: isize = 6;
 
 /// 按值传递的 CGPoint(f64 x/y)。
 /// CGPoint passed by value (f64 x/y).
@@ -221,7 +219,7 @@ pub(crate) struct CGPointFFI {
 /// CGSize passed by value (f64 width/height).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(dead_code)]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct CGSizeFFI {
     pub width: f64,
     pub height: f64,
@@ -231,7 +229,7 @@ pub(crate) struct CGSizeFFI {
 /// CGRect passed by value (origin + size).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(dead_code)]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct CGRectFFI {
     pub origin: CGPointFFI,
     pub size: CGSizeFFI,
@@ -249,16 +247,9 @@ extern "C" {
         relative_to_window: u32,
     ) -> *const c_void;
 
-    // 读主显示器的全局坐标区域,用于把 CGEvent 左上角原点坐标换算为 AppKit 左下角坐标。
-    // Read the main display bounds to convert top-left CGEvent points into bottom-left AppKit coordinates.
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn CGMainDisplayID() -> u32;
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn CGDisplayBounds(display: u32) -> CGRectFFI;
-
     // 从 kCGWindowBounds 字典还原 CGRect(失败返回 false)。
     // Restore a CGRect from a kCGWindowBounds dictionary (false on failure).
-    #[allow(dead_code)]
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CGRectMakeWithDictionaryRepresentation(
         dict: *const c_void,
         rect: *mut CGRectFFI,
@@ -284,15 +275,17 @@ extern "C" {
         value: *mut c_void,
     ) -> bool;
 
-    // 窗口字典键:属主 PID、frame(kCGWindowBounds 是嵌套字典)、窗口层。
+    // 窗口字典键:属主 PID、frame(kCGWindowBounds 是嵌套字典)、窗口层、不透明度。
     // Window dictionary keys: owner PID, frame (kCGWindowBounds is a nested dictionary),
-    // window layer.
+    // window layer, alpha.
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) static kCGWindowOwnerPID: CFStringRef;
-    #[allow(dead_code)]
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) static kCGWindowBounds: CFStringRef;
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) static kCGWindowLayer: CFStringRef;
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) static kCGWindowAlpha: CFStringRef;
 }
 
 // ========== 通用 tap 创建流程 / generic tap-creation flow ==========
@@ -474,12 +467,6 @@ extern "C" {
         context: *mut c_void,
     );
     pub(crate) fn IOHIDManagerScheduleWithRunLoop(
-        manager: *mut c_void,
-        runloop: *const c_void,
-        mode: *const c_void,
-    );
-    #[cfg_attr(test, allow(dead_code))]
-    pub(crate) fn IOHIDManagerUnscheduleFromRunLoop(
         manager: *mut c_void,
         runloop: *const c_void,
         mode: *const c_void,
@@ -833,19 +820,6 @@ extern "C" {
     #[cfg_attr(test, allow(dead_code))]
     #[link_name = "objc_msgSend"]
     pub(crate) fn objc_msgSend_release(receiver: *mut AnyObject, selector: Sel);
-
-    /// objc_msgSend 裸调用:调用 +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:]
-    /// 让 WindowServer 执行真实命中测试(自动跳过 ignoresMouseEvents 透明穿透覆盖层)。
-    /// Raw objc_msgSend: call +[NSWindow windowNumberAtPoint:belowWindowWithWindowNumber:] so
-    /// WindowServer performs true hit-testing and skips ignoresMouseEvents click-through overlays.
-    #[cfg_attr(test, allow(dead_code))]
-    #[link_name = "objc_msgSend"]
-    pub(crate) fn objc_msgSend_window_number_at_point(
-        receiver: *mut AnyObject,
-        selector: Sel,
-        point: NSPointFFI,
-        window_number: isize,
-    ) -> isize;
 }
 
 // HID 用途常量 / HID usage constants

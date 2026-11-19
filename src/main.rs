@@ -195,6 +195,9 @@ fn setup_status_bar() {
 
         let _: () = msg_send![status_item, setMenu: menu];
 
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![nsapp, setMainMenu: menu];
+
         // Pump run loop to let SystemUIServer connect
         for _ in 0..10 {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, 1u8);

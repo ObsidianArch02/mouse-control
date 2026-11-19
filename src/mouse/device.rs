@@ -32,6 +32,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -99,23 +100,114 @@ unsafe impl Sync for DeviceRegistry {}
 
 static REGISTRY: OnceLock<Mutex<DeviceRegistry>> = OnceLock::new();
 
-/// 鼠标线程的 CFRunLoop(由 start_plug_monitor 记录)。注册表 client 要调度到这个
-/// runloop 匹配才会常驻(见 build_state);enumeration 可能先于插拔监听执行,
-/// 故用运行时读取而非启动时一次性传入。裸指针用 Send+Sync 包装(与 ManagerMutex 同款)。
-/// The mouse thread's CFRunLoop (recorded by start_plug_monitor). The registry client must be
-/// scheduled on it for matching to stay live (see build_state); enumeration can run before
-/// the plug monitor starts, so the value is read at runtime, not passed in once at startup.
-/// The raw pointer is wrapped with Send+Sync (same pattern as ManagerMutex).
-struct RunloopMutex(Mutex<Option<crate::mouse::ffi::CFRunLoopRef>>);
-unsafe impl Send for RunloopMutex {}
-unsafe impl Sync for RunloopMutex {}
+/// 专用 hid-monitor 线程的 CFRunLoop(承接 IOHIDManager 与 IOHIDEventSystemClient,
+/// 与高实时性的 mouse-tap 线程彻底隔离)。启动握手通过 Mutex + Condvar 完成,即使
+/// IOHIDManagerCreate 失败也不会死锁。
+/// Dedicated hid-monitor thread's CFRunLoop (hosts IOHIDManager and IOHIDEventSystemClient,
+/// isolated from the real-time mouse-tap thread). Startup handshake uses Mutex + Condvar so
+/// callers never deadlock even if IOHIDManagerCreate returns null.
+struct HidRunloopState {
+    ready: bool,
+    runloop: Option<crate::mouse::ffi::CFRunLoopRef>,
+}
+unsafe impl Send for HidRunloopState {}
+unsafe impl Sync for HidRunloopState {}
 
-static MOUSE_RUNLOOP: OnceLock<RunloopMutex> = OnceLock::new();
+static HID_RUNLOOP: OnceLock<(Mutex<HidRunloopState>, Condvar)> = OnceLock::new();
+static HID_MONITOR_THREAD: OnceLock<()> = OnceLock::new();
+static PLUG_MONITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-fn mouse_runloop_static() -> &'static Mutex<Option<crate::mouse::ffi::CFRunLoopRef>> {
-    &MOUSE_RUNLOOP
-        .get_or_init(|| RunloopMutex(Mutex::new(None)))
-        .0
+fn hid_runloop_sync() -> &'static (Mutex<HidRunloopState>, Condvar) {
+    HID_RUNLOOP.get_or_init(|| {
+        (
+            Mutex::new(HidRunloopState {
+                ready: false,
+                runloop: None,
+            }),
+            Condvar::new(),
+        )
+    })
+}
+
+fn ensure_hid_runloop() -> Option<crate::mouse::ffi::CFRunLoopRef> {
+    let pair = hid_runloop_sync();
+    HID_MONITOR_THREAD.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("hid-monitor".into())
+            .spawn(|| {
+                let pair = hid_runloop_sync();
+                let started = objc2::rc::autoreleasepool(|_| unsafe {
+                    let rl = CFRunLoopGetCurrent();
+                    let manager_obj = IOHIDManagerCreate(std::ptr::null(), 0);
+                    if manager_obj.is_null() {
+                        log_info!("[device] failed to create IOHIDManager");
+                        let mut state = pair.0.lock().unwrap();
+                        state.ready = true;
+                        state.runloop = None;
+                        pair.1.notify_all();
+                        return false;
+                    }
+                    // matching:PrimaryUsagePage=Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad}。
+                    // 与 build_state 的过滤一致。
+                    // Matching: PrimaryUsagePage = Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad},
+                    // mirroring build_state's filter.
+                    let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
+                    let page_val: *mut AnyObject = msg_send![
+                        class!(NSNumber),
+                        numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32
+                    ];
+                    let dict: *mut AnyObject = msg_send![
+                        class!(NSDictionary),
+                        dictionaryWithObject: page_val,
+                        forKey: page_key
+                    ];
+                    let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
+                    IOHIDManagerSetDeviceMatchingMultiple(manager_obj, arr as *const c_void);
+                    CFRelease(page_key as *const c_void);
+
+                    let cb: Option<
+                        unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void),
+                    > = Some(
+                        device_change_callback
+                            as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void),
+                    );
+                    IOHIDManagerRegisterDeviceMatchingCallback(
+                        manager_obj,
+                        cb,
+                        std::ptr::null_mut(),
+                    );
+                    IOHIDManagerRegisterDeviceRemovalCallback(
+                        manager_obj,
+                        cb,
+                        std::ptr::null_mut(),
+                    );
+                    IOHIDManagerScheduleWithRunLoop(
+                        manager_obj,
+                        rl,
+                        crate::mouse::ffi::kCFRunLoopDefaultMode,
+                    );
+                    crate::ffi::CFRetain(rl as *const c_void);
+                    *manager_static().lock().unwrap() = manager_obj;
+                    log_info!("[device] plug/unplug monitor started.");
+
+                    let mut state = pair.0.lock().unwrap();
+                    state.ready = true;
+                    state.runloop = Some(rl);
+                    pair.1.notify_all();
+                    true
+                });
+                if started {
+                    unsafe { CFRunLoopRun() };
+                }
+            })
+            .expect("failed to spawn hid-monitor thread");
+    });
+
+    let mut state = pair.0.lock().unwrap();
+    while !state.ready {
+        state = pair.1.wait(state).unwrap();
+    }
+    state.runloop
 }
 
 /// last_active 的设备 (VID, PID)(归因失败时的回退)。由 event_tap 回调在每次成功归因后更新。
@@ -241,7 +333,7 @@ unsafe fn build_state() -> RegistryState {
         // per-device settings (e.g. reverse scrolling) don't apply after startup until a
         // working client is re-enumerated. Scheduling keeps the matching live and makes
         // attribution reliable (same approach as LinearMouse).
-        if let Some(rl) = *mouse_runloop_static().lock().unwrap() {
+        if let Some(rl) = ensure_hid_runloop() {
             crate::ffi::CFRetain(rl as *const c_void);
             IOHIDEventSystemClientScheduleWithRunLoop(
                 client,
@@ -483,7 +575,9 @@ unsafe extern "C" fn device_change_callback(
     _sender: *mut c_void,
     _callback: *mut c_void,
 ) {
-    notify_plug_signal();
+    if PLUG_MONITOR_ACTIVE.load(Ordering::Acquire) {
+        notify_plug_signal();
+    }
 }
 
 /// 惰性启动 plug worker 线程(仅一次;在注册回调前调用,保证信号有消费者)。
@@ -543,90 +637,20 @@ unsafe fn handle_plug_event() {
     crate::mouse::pointer::apply();
 }
 
-/// 启动设备插拔监听:创建 IOHIDManager,注册接入/移除回调,挂到指定 RunLoop。
-/// 由鼠标线程调用(传该线程的 CFRunLoop),回调即在那个线程执行。matching 与枚举
-/// 一致:Generic Desktop 页的指针/鼠标/触控板。
-///
-/// Start device plug/unplug monitoring: create an IOHIDManager, register attach/detach callbacks,
-/// and schedule it on the given RunLoop (the mouse thread's), so callbacks run on that thread.
-/// Matching mirrors enumeration: pointer/mouse/trackpad on the Generic Desktop page.
-pub(crate) unsafe fn start_plug_monitor(runloop: crate::mouse::ffi::CFRunLoopRef) {
-    objc2::rc::autoreleasepool(|_| unsafe {
-        crate::ffi::CFRetain(runloop as *const c_void);
-        let old_rl = mouse_runloop_static().lock().unwrap().replace(runloop);
-        // 先启动 plug worker(惰性,仅一次),再注册回调,信号必有消费者。
-        // Start the plug worker first (lazily, once), then register callbacks, so every signal
-        // has a consumer.
-        ensure_plug_worker();
-
-        let m = manager_static();
-        let mut m = m.lock().unwrap();
-        if !m.is_null() {
-            if let Some(old) = old_rl {
-                if old != runloop {
-                    IOHIDManagerUnscheduleFromRunLoop(
-                        *m,
-                        old,
-                        crate::mouse::ffi::kCFRunLoopDefaultMode,
-                    );
-                }
-                CFRelease(old as *const c_void);
-            }
-            IOHIDManagerScheduleWithRunLoop(*m, runloop, crate::mouse::ffi::kCFRunLoopDefaultMode);
-            drop(m);
-            notify_plug_signal();
-            return;
-        }
-        if let Some(old) = old_rl {
-            CFRelease(old as *const c_void);
-        }
-
-        let manager_obj = IOHIDManagerCreate(std::ptr::null(), 0);
-        if manager_obj.is_null() {
-            log_info!("[device] failed to create IOHIDManager");
-            return;
-        }
-        // matching:PrimaryUsagePage=Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad}。
-        // 与 build_state 的过滤一致。
-        // Matching: PrimaryUsagePage = Generic Desktop + PrimaryUsage in {Pointer, Mouse, Trackpad},
-        // mirroring build_state's filter.
-        let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
-        let page_val: *mut AnyObject =
-            msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
-        let dict: *mut AnyObject =
-            msg_send![class!(NSDictionary), dictionaryWithObject: page_val, forKey: page_key];
-        let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
-        IOHIDManagerSetDeviceMatchingMultiple(manager_obj, arr as *const c_void);
-        CFRelease(page_key as *const c_void);
-
-        let cb: Option<unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void)> = Some(
-            device_change_callback
-                as unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void),
-        );
-        IOHIDManagerRegisterDeviceMatchingCallback(manager_obj, cb, std::ptr::null_mut());
-        IOHIDManagerRegisterDeviceRemovalCallback(manager_obj, cb, std::ptr::null_mut());
-        IOHIDManagerScheduleWithRunLoop(
-            manager_obj,
-            runloop,
-            crate::mouse::ffi::kCFRunLoopDefaultMode,
-        );
-        *m = manager_obj;
-        log_info!("[device] plug/unplug monitor started.");
-    });
+/// 启动设备插拔监听:激活回调转发并确保专用 hid-monitor 线程已启动。
+/// Start device plug/unplug monitoring: activate callback forwarding and ensure the
+/// dedicated hid-monitor thread is running.
+pub(crate) unsafe fn start_plug_monitor() {
+    ensure_plug_worker();
+    let was_active = PLUG_MONITOR_ACTIVE.swap(true, Ordering::AcqRel);
+    let _ = ensure_hid_runloop();
+    if !was_active && !registry().lock().unwrap().client.is_null() {
+        notify_plug_signal();
+    }
 }
 
-pub(crate) unsafe fn detach_plug_monitor(runloop: crate::mouse::ffi::CFRunLoopRef) {
-    let m = manager_static().lock().unwrap();
-    if !m.is_null() {
-        IOHIDManagerUnscheduleFromRunLoop(*m, runloop, crate::mouse::ffi::kCFRunLoopDefaultMode);
-    }
-    drop(m);
-    let mut slot = mouse_runloop_static().lock().unwrap();
-    if *slot == Some(runloop) {
-        if let Some(rl) = slot.take() {
-            CFRelease(rl as *const c_void);
-        }
-    }
+pub(crate) unsafe fn detach_plug_monitor() {
+    PLUG_MONITOR_ACTIVE.store(false, Ordering::Release);
 }
 
 // ========== 归因 / attribution ==========
