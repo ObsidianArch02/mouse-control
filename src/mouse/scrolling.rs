@@ -30,16 +30,23 @@ pub(crate) fn should_flip(user_reverse: bool) -> bool {
 
 // ========== 滚动模式 / Scroll mode ==========
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// 统一像素模式未显式指定 line_height 时的默认每行像素量(pt)。
+/// Default pixels per line in unified pixel mode when line_height is omitted.
+pub(crate) const DEFAULT_LINE_HEIGHT: u32 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScrollMode {
     Default,
     Line,
+    Pixel,
+    Discrete,
     Continuous,
 }
 
-/// 离散滚轮事件的单位:行(系统的行→像素换算)或像素(line_height 配置,修"单行偏短")。
-/// Unit for discrete scroll wheel events: lines (the system's line-to-pixel conversion) or
-/// pixels (the line_height config, fixing "short single lines").
+/// 合成滚轮事件的单位:行(离散事件,hasPreciseScrollingDeltas=false)或像素(精准事件,
+/// hasPreciseScrollingDeltas=true,绕过各应用自身的离散滚轮倍率)。
+/// Unit for synthetic scroll wheel events: lines (discrete, hasPreciseScrollingDeltas=false)
+/// or pixels (precise, hasPreciseScrollingDeltas=true, bypassing per-app discrete multipliers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScrollUnit {
     Line,
@@ -50,6 +57,8 @@ impl ScrollMode {
     pub(crate) fn from_str(s: &str) -> Self {
         match s {
             "line" => Self::Line,
+            "pixel" => Self::Pixel,
+            "discrete" => Self::Discrete,
             "continuous" => Self::Continuous,
             _ => Self::Default,
         }
@@ -60,6 +69,8 @@ impl ScrollMode {
         match self {
             Self::Default => "default",
             Self::Line => "line",
+            Self::Pixel => "pixel",
+            Self::Discrete => "discrete",
             Self::Continuous => "continuous",
         }
     }
@@ -74,18 +85,19 @@ impl ScrollMode {
 
     #[allow(dead_code)]
     pub(crate) fn all_labels() -> &'static [&'static str] {
-        &["default", "line", "continuous"]
+        &["default", "line", "pixel", "discrete", "continuous"]
     }
 }
 
 /// 根据解析后的配置计算要 post 的滚动 delta 与事件单位。
-/// 处理反转 + 行模式的行数归一化;行模式配置了 line_height 时改发像素单位事件,
-/// delta = line_count x line_height(系统的行→像素换算偏小,单行体感偏短)。
+/// - `Pixel`:统一精准像素模式,始终发像素单位(delta = line_count x line_height,缺省 20 pt)。
+/// - `Discrete`:纯离散刻度回退模式,始终发行单位(忽略继承的 line_height)。
+/// - `Line`:兼容模式,设 line_height 时发像素单位,否则发行单位。
 ///
 /// Compute the scroll delta and event unit to post from the resolved config.
-/// Handles reversal + line-mode normalization; when line_height is set in line mode the
-/// event switches to pixel units with delta = line_count x line_height (the system's
-/// line-to-pixel conversion is too small, making a single line feel short).
+/// - `Pixel`: unified precise pixel mode, always pixel units (line_count x line_height, default 20 pt).
+/// - `Discrete`: explicit discrete tick fallback, always line units (ignores inherited line_height).
+/// - `Line`: compatibility mode, pixel units when line_height is set, otherwise line units.
 pub(crate) fn compute_delta(
     dy: i64,
     dx: i64,
@@ -96,6 +108,30 @@ pub(crate) fn compute_delta(
 
     let (mut ndy, mut ndx, unit) = match mode {
         ScrollMode::Default => (dy as i32, dx as i32, ScrollUnit::Line),
+        ScrollMode::Discrete => {
+            let sign_y = if dy != 0 { dy.signum() } else { 0 };
+            let sign_x = if dx != 0 { dx.signum() } else { 0 };
+            let line_count = r.line_count.clamp(1, crate::config::MAX_LINE_COUNT) as i64;
+            (
+                (sign_y * line_count) as i32,
+                (sign_x * line_count) as i32,
+                ScrollUnit::Line,
+            )
+        }
+        ScrollMode::Pixel => {
+            let sign_y = if dy != 0 { dy.signum() } else { 0 };
+            let sign_x = if dx != 0 { dx.signum() } else { 0 };
+            let h = r
+                .line_height
+                .unwrap_or(DEFAULT_LINE_HEIGHT)
+                .clamp(1, crate::config::MAX_LINE_HEIGHT) as i64;
+            let magnitude = r.line_count.clamp(1, crate::config::MAX_LINE_COUNT) as i64 * h;
+            (
+                (sign_y * magnitude) as i32,
+                (sign_x * magnitude) as i32,
+                ScrollUnit::Pixel,
+            )
+        }
         ScrollMode::Line => {
             let sign_y = if dy != 0 { dy.signum() } else { 0 };
             let sign_x = if dx != 0 { dx.signum() } else { 0 };
@@ -166,9 +202,14 @@ mod tests {
     fn scroll_mode_parses_all_labels() {
         assert_eq!(ScrollMode::from_str("default"), ScrollMode::Default);
         assert_eq!(ScrollMode::from_str("line"), ScrollMode::Line);
+        assert_eq!(ScrollMode::from_str("pixel"), ScrollMode::Pixel);
+        assert_eq!(ScrollMode::from_str("discrete"), ScrollMode::Discrete);
         assert_eq!(ScrollMode::from_str("continuous"), ScrollMode::Continuous);
         assert_eq!(ScrollMode::from_str("unknown"), ScrollMode::Default);
-        assert_eq!(ScrollMode::all_labels(), &["default", "line", "continuous"]);
+        assert_eq!(
+            ScrollMode::all_labels(),
+            &["default", "line", "pixel", "discrete", "continuous"]
+        );
     }
 
     #[test]
@@ -217,5 +258,42 @@ mod tests {
         // 反转开关继续生效。
         // The reverse toggle still applies.
         assert_eq!(compute_delta(1, 0, &r(true)), (-48, 0, ScrollUnit::Pixel));
+    }
+
+    #[test]
+    fn pixel_mode_uses_default_or_custom_line_height() {
+        let default_h = crate::mouse::resolve::ResolvedMouse {
+            scroll_mode: ScrollMode::Pixel,
+            line_count: 1,
+            line_height: None,
+            reverse_scroll: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_delta(5, 0, &default_h),
+            (DEFAULT_LINE_HEIGHT as i32, 0, ScrollUnit::Pixel)
+        );
+
+        let custom_h = crate::mouse::resolve::ResolvedMouse {
+            scroll_mode: ScrollMode::Pixel,
+            line_count: 2,
+            line_height: Some(24),
+            reverse_scroll: true,
+            ..Default::default()
+        };
+        assert_eq!(compute_delta(1, 0, &custom_h), (-48, 0, ScrollUnit::Pixel));
+    }
+
+    #[test]
+    fn discrete_mode_ignores_inherited_line_height() {
+        let r = crate::mouse::resolve::ResolvedMouse {
+            scroll_mode: ScrollMode::Discrete,
+            line_count: 3,
+            line_height: Some(24),
+            reverse_scroll: true,
+            ..Default::default()
+        };
+        assert_eq!(compute_delta(7, 0, &r), (-3, 0, ScrollUnit::Line));
+        assert_eq!(compute_delta(-2, 0, &r), (3, 0, ScrollUnit::Line));
     }
 }

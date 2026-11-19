@@ -14,13 +14,9 @@ menu-bar icon, because the agent runs inside the user's GUI session.
 ## Features
 
 - **Reverse scrolling** — flip the wheel direction relative to the system's current setting.
-- **Line scrolling** — turn each wheel notch into a fixed number of lines; an optional
-  `line_height` (pixels per line) switches line mode to pixel-unit events so the travel per
-  notch is app-independent.
-- **Continuous scrolling** — emit trackpad-style pixel scroll events for apps that behave
-  poorly with discrete wheel events (for example iPhone Mirroring).
-- **Disable pointer acceleration** — 1:1 linear cursor tracking (macOS 14+ linear-scaling
-  switch, legacy fallback on older systems). Original values are restored on disable/quit.
+- **Unified pixel scrolling (`pixel`)** — emit precise pixel-unit events (`line_count × line_height`, default `20 pt` per line) so each notch bypasses per-app discrete multipliers (such as Ghostty `discrete:3`, Kitty `5.0`, or Chromium's 40 px step).
+- **Discrete line scrolling (`discrete` / `line`)** — emit discrete line-unit wheel ticks as a fallback for apps that expect non-precise mouse wheel events (`discrete` always uses line units and ignores inherited `line_height`).
+- **Continuous scrolling (`continuous`)** — emit trackpad-style pixel scroll events for apps that behave poorly with discrete wheel events (for example iPhone Mirroring).
 - **Side-button remapping** — map side buttons (3/4) to keyboard shortcuts or media keys
   (e.g. `3 = "ctrl+left"` for browser back). Holding the button presses the target, releasing
   it releases; no auto-repeat.
@@ -33,9 +29,11 @@ menu-bar icon, because the agent runs inside the user's GUI session.
   unfocused window of that app without activating it first.
 - **Hot toggle & hot reload** — enable/disable from the menu (persisted to config), or edit
   the TOML and choose *Reload Config*; no restart needed.
-- **Bluetooth resilience** — device plug/unplug is monitored, so the attribution chain
-  recovers automatically after a Bluetooth disconnect/reconnect, and pointer acceleration is
-  re-applied.
+- **Bluetooth resilience** — device plug/unplug is monitored on a dedicated HID run loop, so
+  the attribution chain recovers automatically after a Bluetooth disconnect/reconnect.
+- **No pointer acceleration intervention** — pointer tracking is left untouched for native
+  macOS system settings. Legacy `[mouse.profiles.pointer]` blocks remain accepted in TOML
+  and ignored at runtime.
 
 ## Requirements
 
@@ -93,12 +91,9 @@ enabled = true
 
 [[mouse.profiles]]              # no device fields = "All Mice" default profile
 reverse_scroll = true           # Windows-style: reverse relative to the system direction
-scroll_mode = "line"            # "default" | "line" | "continuous"
-line_count = 3                  # lines per notch in line mode (1..=20)
+scroll_mode = "pixel"           # "default" | "line" | "pixel" | "discrete" | "continuous"
+line_count = 3                  # lines per notch (1..=20)
 button_map = { "3" = "ctrl+left", "4" = "ctrl+right" }  # side buttons: desktop left/right
-
-[mouse.profiles.pointer]
-disable_acceleration = true     # 1:1 linear tracking
 
 [[mouse.profiles]]              # optional per-device override profile
 device_vendor_id = 1133
@@ -140,12 +135,13 @@ with a logged error — the app never refuses to start. To find a device's VID:P
 logging and watch the `[mouse] scroll dev=` line in the log, or use
 `system_profiler SPUSBDataType`.
 
-`line_height` (absent by default, valid range 1..=100) customizes how many pixels one line
-covers in line mode. It only takes effect in line mode: when set, the app posts pixel-unit
-wheel events with `line_count × line_height` pixels per notch, so the travel per notch no
-longer depends on each app's own line-to-pixel conversion (some apps, like Notes, convert one
-line to very few pixels). Without `line_height`, line mode posts ordinary line-unit events as
-before.
+`line_height` (absent by default, valid range 1..=100) customizes how many points one line
+covers when emitting precise pixel events (`kCGScrollEventUnitPixel`, which sets
+`hasPreciseScrollingDeltas = true`). In `pixel` mode, each notch emits
+`line_count × line_height` points (defaulting `line_height` to `20` when omitted). In
+`discrete` mode, each notch always emits `line_count` discrete line units and ignores any
+inherited `line_height`. In legacy `line` mode, setting `line_height` switches to pixel
+units while omitting it emits discrete line units.
 
 ### Side-button actions (`button_map`)
 
@@ -178,6 +174,6 @@ Logs go to `~/Library/Logs/mouse-control/mouse-control-<timestamp>.log` (30-day 
 ## Menu
 
 - **Enable Mouse Control** — hot start/stop (checkmark shows the state; persisted to config).
-- **Reload Config** — re-read the TOML, invalidate the device-resolution cache, re-apply
-  pointer settings, and hot start/stop the event tap.
-- **Quit** — restores pointer acceleration before exiting.
+- **Reload Config** — re-read the TOML, invalidate the resolution cache, and hot start/stop
+  the event tap.
+- **Quit** — releases any held side-button keys before exiting.

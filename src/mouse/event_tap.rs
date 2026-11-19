@@ -320,47 +320,70 @@ unsafe extern "C" fn mouse_event_tap_callback(
         } else {
             None
         };
-        let resolved = if debug_enabled {
-            let r = resolve::resolve(dev_key, app_key.clone());
-            log_debug!(
-                "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} flags=0x{:x} reverse={}",
-                dev_key,
-                app_key,
-                loc.x,
-                loc.y,
-                dy,
-                dx,
-                flags,
-                r.reverse_scroll
-            );
-            r
-        } else {
-            resolve::resolve(dev_key, app_key)
-        };
+        let resolved = resolve::resolve(dev_key, app_key.clone());
 
-        // Continuous:像素级透传 + 反转,合成连续事件。Default / Line:计算 delta(透传或
-        // 行数归一化 + 反转)-> post 离散事件。无论哪种都丢弃原 event。
-        // Continuous: pixel passthrough + reverse, then post a continuous event. Default / Line:
-        // compute delta (passthrough or line-count normalization + reverse) -> post a discrete
-        // event. Either way the original event is dropped.
+        // Continuous:像素级透传 + 反转,合成连续事件。Default / Line / Pixel / Discrete:
+        // 计算 delta 与单位 -> post 合成事件。无论哪种都丢弃原 event。
+        // Continuous: pixel passthrough + reverse, then post a continuous event.
+        // Default / Line / Pixel / Discrete: compute delta and unit -> post synthetic event.
+        // Either way the original event is dropped.
         if resolved.scroll_mode == ScrollMode::Continuous {
             let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, &resolved);
+            if debug_enabled {
+                log_debug!(
+                    "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode=continuous out=({},{},cont) flags=0x{:x} reverse={}",
+                    dev_key,
+                    app_key,
+                    loc.x,
+                    loc.y,
+                    dy,
+                    dx,
+                    ndy,
+                    ndx,
+                    flags,
+                    resolved.reverse_scroll
+                );
+            }
             post_continuous_scroll_event(ndy, ndx, flags, loc);
         } else {
             let (ndy, ndx, unit) = compute_delta(dy, dx, &resolved);
+            if debug_enabled {
+                log_debug!(
+                    "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode={} lc={} lh={:?} out=({},{},{:?}) flags=0x{:x} reverse={}",
+                    dev_key,
+                    app_key,
+                    loc.x,
+                    loc.y,
+                    dy,
+                    dx,
+                    resolved.scroll_mode.as_str(),
+                    resolved.line_count,
+                    resolved.line_height,
+                    ndy,
+                    ndx,
+                    unit,
+                    flags,
+                    resolved.reverse_scroll
+                );
+            }
             post_scroll_event(ndy, ndx, unit, flags, loc);
         }
         std::ptr::null_mut()
     } else if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN || event_type == K_CG_EVENT_OTHER_MOUSE_UP {
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
+        let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
         log_button_event_diag(event_type, event, button, flags);
 
-        // 侧键映射:先归因设备再解析生效配置;命中 3/4 映射时合成键盘动作并丢弃
-        // 原鼠标事件,未命中时原样透传(保持系统默认行为)。
-        // Side-button map: attribute the device and frontmost app, then resolve; on a 3/4 mapping
-        // hit, synthesize the keyboard action and drop the original mouse event; otherwise pass
-        // the event through unchanged.
-        let dev_key = device::device_from_cgevent(event);
+        // 侧键映射:仅在配置了 per-device 档或开启 debug 日志时查询设备 sender,减少热路径开销;
+        // 命中 3/4 映射时合成键盘动作并丢弃原鼠标事件,未命中时原样透传(保持系统默认行为)。
+        // Side-button map: query the HID sender only when per-device profiles or debug logging need
+        // it; on a 3/4 mapping hit, synthesize the keyboard action and drop the original event;
+        // otherwise pass the event through unchanged.
+        let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
+            device::device_from_cgevent(event)
+        } else {
+            None
+        };
         let app_key = app::active_identity();
         let resolved = resolve::resolve(dev_key, app_key.clone());
         if let Some(action) = resolved.button_map.get(&(button as u32)) {

@@ -217,7 +217,8 @@ impl Config {
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
             if let Some(ref mode) = p.scroll_mode {
-                if !["default", "line", "continuous"].contains(&mode.as_str()) {
+                if !["default", "line", "pixel", "discrete", "continuous"].contains(&mode.as_str())
+                {
                     errs.push(tf("errors.mouse_scroll_mode_invalid", &[("value", mode)]));
                     // 用 prefix 区分哪个档出错,便于定位。
                     // Use the prefix to indicate which profile failed.
@@ -813,5 +814,36 @@ line_height = 24
         assert_eq!(cfg.mouse.profiles[3].line_count, Some(1));
         assert_eq!(cfg.mouse.profiles[4].line_count, Some(2));
         assert_eq!(cfg.mouse.profiles[4].line_height, Some(24));
+    }
+
+    #[test]
+    fn pixel_and_discrete_scroll_modes_are_valid_and_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles.clear();
+        cfg.mouse.profiles.push(MouseProfile {
+            scroll_mode: Some("pixel".into()),
+            line_count: Some(3),
+            ..Default::default()
+        });
+        cfg.mouse.profiles.push(MouseProfile {
+            app_bundle_id: Some("com.figma.Desktop".into()),
+            scroll_mode: Some("discrete".into()),
+            line_count: Some(1),
+            ..Default::default()
+        });
+
+        let errs = cfg.validate();
+        assert!(errs.is_empty());
+
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed.mouse.profiles[0].scroll_mode.as_deref(),
+            Some("pixel")
+        );
+        assert_eq!(
+            parsed.mouse.profiles[1].scroll_mode.as_deref(),
+            Some("discrete")
+        );
     }
 }

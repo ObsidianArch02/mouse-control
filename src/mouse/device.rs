@@ -629,12 +629,6 @@ unsafe fn handle_plug_event() {
     // the up arrives), so release every held target to keep modifiers like cmd/ctrl/opt/
     // shift from sticking.
     crate::mouse::buttons::release_all();
-    // apply 已异步化:这里只是入队,立即返回。apply 内部检查 mouse.enabled,未启用时
-    // 自动跳过;幂等可重复调用,待处理请求在 pointer 侧合并为一次。
-    // apply is async now: this only enqueues and returns immediately. apply checks
-    // mouse.enabled internally and skips when disabled; idempotent, safe to call repeatedly,
-    // and pending requests coalesce into one on the pointer side.
-    crate::mouse::pointer::apply();
 }
 
 /// 启动设备插拔监听:激活回调转发并确保专用 hid-monitor 线程已启动。

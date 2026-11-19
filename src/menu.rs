@@ -100,22 +100,19 @@ pub(crate) extern "C" fn handle_mouse_enable_toggle(
             );
         }
         mouse::start();
-        mouse::pointer::apply();
         log_info!("Mouse control enabled via menu.");
     } else {
         buttons::release_all();
         mouse::stop();
-        mouse::pointer::restore();
         log_info!("Mouse control disabled via menu.");
     }
     refresh_menu_titles();
 }
 
-/// 重载配置文件:应用新配置(locale/日志级别),失效设备解析缓存,重应用指针设置,
-/// 并按 enabled 热启停事件 tap。
+/// 重载配置文件:应用新配置(locale/日志级别),失效设备解析缓存,并按 enabled 热启停事件 tap。
 ///
 /// Reload the config file: apply it (locale/log level), invalidate the device-resolution
-/// cache, re-apply pointer settings, and hot start/stop the event tap per `enabled`.
+/// cache, and hot start/stop the event tap per `enabled`.
 pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     let errs = reload_config();
     if errs.is_empty() {
@@ -126,19 +123,16 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
             log_info!("  • {}", e);
         }
     }
-    // 配置可能已变化:失效 per-device 解析缓存 + 重应用指针设置。
+    // 配置可能已变化:先释放按住的侧键目标键,再失效解析缓存。
     // Config may have changed: release any held side-button actions (so cmd/ctrl/opt/shift
-    // never stick after a reload), invalidate the per-device resolve cache + re-apply
-    // pointer settings.
+    // never stick after a reload) and invalidate the resolve cache.
     buttons::release_all();
     resolve::invalidate_cache();
     let enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
     if enabled {
         mouse::start();
-        mouse::pointer::apply();
     } else {
         mouse::stop();
-        mouse::pointer::restore();
     }
     refresh_menu_titles();
 }
@@ -150,10 +144,6 @@ pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mu
     // never stay stuck after the app exits.
     buttons::release_all();
     buttons::flush();
-    // 退出前恢复指针加速设置(否则系统鼠标保持线性,直到用户手动重置)。
-    // Restore pointer acceleration settings before quitting (otherwise the mouse stays
-    // linear until the user resets it manually).
-    mouse::pointer::restore();
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, terminate: std::ptr::null::<AnyObject>()];

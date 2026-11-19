@@ -9,7 +9,6 @@ pub(crate) mod buttons;
 pub(crate) mod device;
 pub(crate) mod event_tap;
 pub(crate) mod ffi;
-pub(crate) mod pointer;
 pub(crate) mod resolve;
 pub(crate) mod scrolling;
 

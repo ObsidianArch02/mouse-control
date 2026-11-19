@@ -11,7 +11,7 @@ quit = "Quit"
 i18n_locale_invalid = 'i18n.locale: "{value}" is not one of auto, en, zh-Hans, zh-Hant'
 logging_level_invalid = "logging.level: '{value}' is invalid (expect: debug, info)"
 config_read_failed = "cannot read config: {error}"
-mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line, continuous'
+mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line, pixel, discrete, continuous'
 mouse_line_count_invalid = "line_count: {value} must be 1..=20"
 mouse_button_map_invalid = 'button_map: "{value}" is not a valid action (format: [modifier+]key, e.g. "ctrl+left")'
 

@@ -483,11 +483,6 @@ extern "C" {
         client: *mut c_void,
         key: *const c_void,
     ) -> *mut c_void;
-    pub(crate) fn IOHIDServiceClientSetProperty(
-        client: *mut c_void,
-        key: *const c_void,
-        value: *mut c_void,
-    ) -> bool;
     // 判断 HID service 是否符合某 (usage page, usage) 对(公开 API,系统 SDK 自带)。
     // 比读 PrimaryUsage 单值可靠:有些真实鼠标(如 ATK A9 SE 这类 Nearlink/星闪设备)
     // 的 PrimaryUsage 被系统报成 Keyboard(6),但它的 DeviceUsagePairs 声明了 Mouse(1,2),
@@ -629,15 +624,6 @@ pub(crate) fn is_synthetic_scroll_marker(user_data: i64) -> bool {
 
 // ========== 属性键常量 / property key constants ==========
 
-/// 私有键:线性缩放开关(macOS 14 Sonoma+)。1 = 线性跟踪(无加速)。
-/// Private key: linear-scaling switch (macOS 14 Sonoma+). 1 = linear tracking (no acceleration).
-pub(crate) const KEY_LINEAR_SCALING: &str = "HIDUseLinearScalingMouseAcceleration";
-/// 每设备指针加速(现代 macOS)。
-/// Per-device pointer acceleration (modern macOS).
-pub(crate) const KEY_POINTER_ACCEL: &str = "HIDPointerAcceleration";
-/// 鼠标加速类型键(旧系统回退)。
-/// Mouse acceleration type key (legacy fallback).
-pub(crate) const KEY_MOUSE_ACCEL: &str = "HIDMouseAcceleration";
 /// 设备主用途页(matching 用:按 Generic Desktop 页过滤后,再用 ConformsTo 判定指针设备)。
 /// Device primary usage page (for matching: filter to the Generic Desktop page, then decide
 /// pointer devices via ConformsTo).

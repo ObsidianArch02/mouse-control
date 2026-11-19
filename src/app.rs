@@ -32,6 +32,8 @@ const ACTIVATION_POLICY_PROHIBITED: isize = 2;
 const PID_MAP_MAX: usize = 512;
 const MAX_WINDOW_LAYER: i32 = 20;
 const WINDOW_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+const POST_SWITCH_SETTLE_FIRST: Duration = Duration::from_millis(150);
+const POST_SWITCH_SETTLE_SECOND: Duration = Duration::from_millis(400);
 
 /// 当前前台 app 的稳定身份。字段来自 NSRunningApplication;无 bundle 的小工具/脚本只有
 /// localized_name,两者都缺失时 per-app 档只会命中无 app 字段的全局/设备档。
@@ -65,6 +67,56 @@ struct WindowSnapshot {
     updated_at: Option<Instant>,
 }
 
+struct SnapSignalState {
+    immediate: bool,
+    next_due: Option<Instant>,
+    follow_up_due: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapWaitAction {
+    RunNow,
+    WaitFor(Duration),
+    WaitForever,
+}
+
+impl SnapSignalState {
+    const fn new() -> Self {
+        Self {
+            immediate: false,
+            next_due: None,
+            follow_up_due: None,
+        }
+    }
+
+    fn request_immediate(&mut self) -> bool {
+        let notify = !self.immediate;
+        self.immediate = true;
+        notify
+    }
+
+    fn request_post_switch(&mut self, now: Instant) {
+        self.immediate = true;
+        self.next_due = Some(now + POST_SWITCH_SETTLE_FIRST);
+        self.follow_up_due = Some(now + POST_SWITCH_SETTLE_SECOND);
+    }
+
+    fn poll_action(&mut self, now: Instant) -> SnapWaitAction {
+        if self.immediate {
+            self.immediate = false;
+            return SnapWaitAction::RunNow;
+        }
+        if let Some(due) = self.next_due {
+            if now >= due {
+                self.next_due = self.follow_up_due.take();
+                return SnapWaitAction::RunNow;
+            }
+            return SnapWaitAction::WaitFor(due.saturating_duration_since(now));
+        }
+        SnapWaitAction::WaitForever
+    }
+}
+
 static ACTIVE_APP: Mutex<Option<AppIdentity>> = Mutex::new(None);
 static PID_MAP: std::sync::LazyLock<Mutex<HashMap<i32, CachedApp>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -77,7 +129,7 @@ static WINDOW_SNAPSHOT: std::sync::LazyLock<Mutex<WindowSnapshot>> =
             updated_at: None,
         })
     });
-static SNAP_SIGNAL: Mutex<bool> = Mutex::new(false);
+static SNAP_SIGNAL: Mutex<SnapSignalState> = Mutex::new(SnapSignalState::new());
 static SNAP_CV: Condvar = Condvar::new();
 static SNAP_WORKER: OnceLock<()> = OnceLock::new();
 
@@ -318,12 +370,20 @@ fn ensure_snap_worker() {
         std::thread::Builder::new()
             .name("window-snap".into())
             .spawn(|| loop {
-                let mut pending = SNAP_SIGNAL.lock().unwrap();
-                while !*pending {
-                    pending = SNAP_CV.wait(pending).unwrap();
+                let mut signal = SNAP_SIGNAL.lock().unwrap();
+                loop {
+                    match signal.poll_action(Instant::now()) {
+                        SnapWaitAction::RunNow => break,
+                        SnapWaitAction::WaitFor(dur) => {
+                            let (s, _) = SNAP_CV.wait_timeout(signal, dur).unwrap();
+                            signal = s;
+                        }
+                        SnapWaitAction::WaitForever => {
+                            signal = SNAP_CV.wait(signal).unwrap();
+                        }
+                    }
                 }
-                *pending = false;
-                drop(pending);
+                drop(signal);
 
                 loop {
                     let target_epoch = APP_EPOCH.load(Ordering::Acquire);
@@ -345,11 +405,17 @@ fn ensure_snap_worker() {
 
 fn request_snapshot_refresh() {
     ensure_snap_worker();
-    let mut pending = SNAP_SIGNAL.lock().unwrap();
-    if !*pending {
-        *pending = true;
+    let mut signal = SNAP_SIGNAL.lock().unwrap();
+    if signal.request_immediate() {
         SNAP_CV.notify_one();
     }
+}
+
+fn request_post_switch_snapshot() {
+    ensure_snap_worker();
+    let mut signal = SNAP_SIGNAL.lock().unwrap();
+    signal.request_post_switch(Instant::now());
+    SNAP_CV.notify_one();
 }
 
 /// 光标坐标处的 app 身份:只读内存窗口快照,不在 event tap 线程发起任何 AppKit/SkyLight IPC;
@@ -475,7 +541,7 @@ extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, notification:
         PID_MAP.lock().unwrap().insert(pid, cached);
     }
     APP_EPOCH.fetch_add(1, Ordering::Release);
-    request_snapshot_refresh();
+    request_post_switch_snapshot();
     if !set_active(identity) {
         return;
     }
@@ -484,11 +550,6 @@ extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, notification:
     // Release held side-button targets before the new app receives events, so modifiers from
     // the old app never stick in the new app.
     crate::mouse::buttons::release_all();
-    // 指针加速可能按 app 覆盖,切 app 时重算并重应用。
-    // Pointer acceleration may be overridden per app; re-evaluate and re-apply on switch.
-    if crate::mouse::resolve::has_per_app_pointer_profiles() {
-        crate::mouse::pointer::apply();
-    }
 }
 
 extern "C" fn handle_app_launch(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
@@ -509,7 +570,7 @@ extern "C" fn handle_app_launch(_self: *mut c_void, _cmd: Sel, notification: *mu
         PID_MAP.lock().unwrap().insert(pid, cached);
     }
     APP_EPOCH.fetch_add(1, Ordering::Release);
-    request_snapshot_refresh();
+    request_post_switch_snapshot();
 }
 
 extern "C" fn handle_app_terminate(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
@@ -525,7 +586,7 @@ extern "C" fn handle_app_terminate(_self: *mut c_void, _cmd: Sel, notification: 
         PID_MAP.lock().unwrap().remove(&term_pid);
     }
     APP_EPOCH.fetch_add(1, Ordering::Release);
-    request_snapshot_refresh();
+    request_post_switch_snapshot();
 }
 
 unsafe fn install_observer() {
@@ -717,6 +778,36 @@ mod tests {
         assert_eq!(
             lookup_window_identity(&snap, 3, 50.0, 50.0, now + WINDOW_SNAPSHOT_TTL),
             (Some(back), true)
+        );
+    }
+
+    #[test]
+    fn snap_signal_schedules_immediate_and_two_settle_passes() {
+        let t0 = Instant::now();
+        let mut s = SnapSignalState::new();
+        assert_eq!(s.poll_action(t0), SnapWaitAction::WaitForever);
+
+        s.request_post_switch(t0);
+        assert_eq!(s.poll_action(t0), SnapWaitAction::RunNow);
+        assert_eq!(
+            s.poll_action(t0 + Duration::from_millis(50)),
+            SnapWaitAction::WaitFor(Duration::from_millis(100))
+        );
+        assert_eq!(
+            s.poll_action(t0 + POST_SWITCH_SETTLE_FIRST),
+            SnapWaitAction::RunNow
+        );
+        assert_eq!(
+            s.poll_action(t0 + Duration::from_millis(200)),
+            SnapWaitAction::WaitFor(Duration::from_millis(200))
+        );
+        assert_eq!(
+            s.poll_action(t0 + POST_SWITCH_SETTLE_SECOND),
+            SnapWaitAction::RunNow
+        );
+        assert_eq!(
+            s.poll_action(t0 + POST_SWITCH_SETTLE_SECOND),
+            SnapWaitAction::WaitForever
         );
     }
 

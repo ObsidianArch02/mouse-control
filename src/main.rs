@@ -278,10 +278,10 @@ fn main() {
         }
     }
 
-    // 5. 配置启用时启动鼠标事件 tap 并应用指针设置(缺 AX 权限时 tap 在线程内有限重试,
-    //    不影响应用启动;退出/停用时 pointer::restore 恢复系统原值)。
-    //    Start the mouse event tap and apply pointer settings when enabled in config.
-    //    Missing Accessibility just makes the tap retry in-thread; the app keeps running.
+    // 5. 配置启用时启动鼠标事件 tap(缺 AX 权限时 tap 在线程内有限重试,不影响应用启动;
+    //    指针加速由现代 macOS 系统原生管理,本进程不再干预指针属性)。
+    //    Start the mouse event tap when enabled in config (missing Accessibility only makes the
+    //    tap retry in-thread; pointer acceleration is left to macOS native settings).
     let mouse_enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
     if mouse_enabled {
         // 缺权限时显式弹系统授权框(每次启动都会检查一次);tap 线程的有限重试会在用户
@@ -300,7 +300,6 @@ fn main() {
             );
         }
         mouse::start();
-        mouse::pointer::apply();
     }
 
     // 6. Run the main event loop (blocks until [NSApp terminate:])

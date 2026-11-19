@@ -33,6 +33,7 @@ pub(crate) struct ResolvedMouse {
     /// (line-unit events). When set, Line mode posts pixel-unit events with
     /// delta = line_count x line_height.
     pub line_height: Option<u32>,
+    #[allow(dead_code)]
     pub disable_acceleration: bool,
     /// 侧键按钮号(3/4)-> 已解析动作。命中即替换原侧键事件,未命中透传。
     /// Side-button number (3/4) -> parsed action. A hit replaces the original side-button
@@ -69,8 +70,7 @@ static CACHE: std::sync::LazyLock<
 
 const FLAG_COMPUTED: u8 = 1 << 0;
 const FLAG_APP_SCROLL: u8 = 1 << 1;
-const FLAG_APP_POINTER: u8 = 1 << 2;
-const FLAG_HAS_DEVICE: u8 = 1 << 3;
+const FLAG_HAS_DEVICE: u8 = 1 << 2;
 
 static APP_PROFILE_FLAGS: AtomicU8 = AtomicU8::new(0);
 
@@ -104,13 +104,6 @@ fn app_profile_flags() -> u8 {
         {
             computed |= FLAG_APP_SCROLL;
         }
-        if p.pointer
-            .as_ref()
-            .and_then(|ptr| ptr.disable_acceleration)
-            .is_some()
-        {
-            computed |= FLAG_APP_POINTER;
-        }
     }
     APP_PROFILE_FLAGS.store(computed, Ordering::Release);
     computed
@@ -118,10 +111,6 @@ fn app_profile_flags() -> u8 {
 
 pub(crate) fn has_per_app_scroll_profiles() -> bool {
     app_profile_flags() & FLAG_APP_SCROLL != 0
-}
-
-pub(crate) fn has_per_app_pointer_profiles() -> bool {
-    app_profile_flags() & FLAG_APP_POINTER != 0
 }
 
 pub(crate) fn has_per_device_profiles() -> bool {
