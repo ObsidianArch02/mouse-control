@@ -81,15 +81,18 @@ unsafe extern "C" {
     pub(crate) fn CGEventCopyIOHIDEvent(event: CGEventRef) -> *mut c_void;
 
     pub(crate) fn CGEventGetLocation(event: CGEventRef) -> CGPointFFI;
+    pub(crate) fn CGEventGetTimestamp(event: CGEventRef) -> u64;
 
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CGEventPost(tap: i32, event: CGEventRef);
 }
 
 pub(crate) const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+pub(crate) const CLOCK_UPTIME_RAW: u32 = 8;
 
 unsafe extern "C" {
     pub(crate) fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    pub(crate) fn clock_gettime_nsec_np(clock_id: u32) -> u64;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]

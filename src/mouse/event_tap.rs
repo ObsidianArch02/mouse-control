@@ -5,12 +5,13 @@ use crate::mouse::device;
 use crate::mouse::ffi::{
     self, is_synthetic_scroll_marker, tap_location, tap_options, tap_placement,
     CFRunLoopGetCurrent, CGEventFlags, CGEventGetFlags, CGEventGetIntegerValueField,
-    CGEventGetLocation, CGEventMask, CGEventRef, CGEventSetDoubleValueField,
-    CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, K_CG_EVENT_SOURCE_USER_DATA,
-    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2,
-    K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2,
-    K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1,
-    K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2, MOS_SYNTHETIC_MARKER,
+    CGEventGetLocation, CGEventGetTimestamp, CGEventMask, CGEventRef, CGEventSetDoubleValueField,
+    CGEventSetIntegerValueField, CGEventTapProxy, CGEventType, CLOCK_UPTIME_RAW,
+    K_CG_EVENT_SOURCE_USER_DATA, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
+    K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_1,
+    K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS,
+    K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
+    MOS_SYNTHETIC_MARKER, clock_gettime_nsec_np,
 };
 use crate::mouse::resolve;
 use crate::mouse::scrolling::{compute_continuous_delta, compute_delta, ScrollMode, ScrollUnit};
@@ -25,6 +26,45 @@ const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
 const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 
 const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
+
+const MAX_SCROLL_EVENT_AGE_NS: u64 = 25_000_000;
+const MAX_SANE_EVENT_AGE_NS: u64 = 10_000_000_000;
+const MIN_SCROLL_INTERVAL_NS: u64 = 8_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDropDecision {
+    Allow,
+    DropStale(u64),
+    DropRateLimit(u64),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ScrollDropGate {
+    last_emitted_ns: u64,
+}
+
+impl ScrollDropGate {
+    const fn new() -> Self {
+        Self { last_emitted_ns: 0 }
+    }
+
+    fn evaluate(&mut self, now_ns: u64, ev_ts_ns: u64) -> ScrollDropDecision {
+        if ev_ts_ns > 0 && now_ns > ev_ts_ns {
+            let age_ns = now_ns - ev_ts_ns;
+            if age_ns > MAX_SCROLL_EVENT_AGE_NS && age_ns < MAX_SANE_EVENT_AGE_NS {
+                return ScrollDropDecision::DropStale(age_ns);
+            }
+        }
+        if self.last_emitted_ns > 0 && now_ns >= self.last_emitted_ns {
+            let dt_ns = now_ns - self.last_emitted_ns;
+            if dt_ns < MIN_SCROLL_INTERVAL_NS {
+                return ScrollDropDecision::DropRateLimit(dt_ns);
+            }
+        }
+        self.last_emitted_ns = now_ns;
+        ScrollDropDecision::Allow
+    }
+}
 
 fn line_delta_from_point(point: i64) -> i64 {
     let line = point / 10;
@@ -152,7 +192,7 @@ fn log_button_event_diag(
 }
 
 fn scroll_app_at_cursor(x: f64, y: f64) -> Option<AppIdentity> {
-    if !resolve::has_per_app_scroll_profiles() {
+    if !app::needs_cursor_window_lookup() {
         return None;
     }
     app::identity_at_point(x, y)
@@ -161,6 +201,9 @@ fn scroll_app_at_cursor(x: f64, y: f64) -> Option<AppIdentity> {
 thread_local! {
     static CURRENT_TAP: Cell<ffi::CFMachPortRef> = const {
         Cell::new(std::ptr::null_mut())
+    };
+    static SCROLL_GATE: Cell<ScrollDropGate> = const {
+        Cell::new(ScrollDropGate::new())
     };
 }
 
@@ -202,12 +245,36 @@ unsafe extern "C" fn mouse_event_tap_callback(
                 return event;
             }
 
+            let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
+            let now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            let ev_ts_ns = CGEventGetTimestamp(event);
+            let decision = SCROLL_GATE.with(|cell| {
+                let mut gate = cell.get();
+                let d = gate.evaluate(now_ns, ev_ts_ns);
+                cell.set(gate);
+                d
+            });
+            match decision {
+                ScrollDropDecision::Allow => {}
+                ScrollDropDecision::DropStale(age_ns) => {
+                    if debug_enabled {
+                        log_debug!("[mouse] scroll dropped stale age={}us", age_ns / 1000);
+                    }
+                    return std::ptr::null_mut();
+                }
+                ScrollDropDecision::DropRateLimit(dt_ns) => {
+                    if debug_enabled {
+                        log_debug!("[mouse] scroll dropped rate_limit dt={}us", dt_ns / 1000);
+                    }
+                    return std::ptr::null_mut();
+                }
+            }
+
             let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
             let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
 
-            let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
             if !debug_enabled && !resolve::has_per_device_profiles() {
-                let scroll = if resolve::has_per_app_scroll_profiles() {
+                let scroll = if app::needs_cursor_window_lookup() {
                     let loc = CGEventGetLocation(event);
                     app::scroll_at_point_or_active(loc.x, loc.y)
                 } else {
@@ -408,6 +475,7 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
                 ffi::CFRunLoopAddSource(rl, source, ffi::kCFRunLoopDefaultMode);
             }
             CURRENT_TAP.with(|c| c.set(tap));
+            SCROLL_GATE.with(|c| c.set(ScrollDropGate::new()));
             ffi::CGEventTapEnable(tap, true);
 
             crate::ffi::CFRetain(rl as *const c_void);
@@ -431,4 +499,64 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             CFRelease(tap as *const c_void);
         })
         .expect("failed to spawn mouse-tap thread")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn scroll_drop_gate_allows_fresh_events_at_normal_cadence() {
+        let mut gate = ScrollDropGate::new();
+        assert_eq!(gate.evaluate(100 * MS, 99 * MS), ScrollDropDecision::Allow);
+        assert_eq!(gate.evaluate(108 * MS, 107 * MS), ScrollDropDecision::Allow);
+        assert_eq!(gate.evaluate(120 * MS, 119 * MS), ScrollDropDecision::Allow);
+    }
+
+    #[test]
+    fn scroll_drop_gate_drops_stale_events_without_blocking_next_fresh_event() {
+        let mut gate = ScrollDropGate::new();
+        assert_eq!(gate.evaluate(100 * MS, 99 * MS), ScrollDropDecision::Allow);
+        assert_eq!(
+            gate.evaluate(150 * MS, 120 * MS),
+            ScrollDropDecision::DropStale(30 * MS)
+        );
+        assert_eq!(gate.evaluate(151 * MS, 150 * MS), ScrollDropDecision::Allow);
+    }
+
+    #[test]
+    fn scroll_drop_gate_ignores_zero_future_or_out_of_range_timestamps() {
+        let mut gate = ScrollDropGate::new();
+        assert_eq!(gate.evaluate(100 * MS, 0), ScrollDropDecision::Allow);
+        assert_eq!(
+            gate.evaluate(120 * MS, 130 * MS),
+            ScrollDropDecision::Allow
+        );
+        assert_eq!(
+            gate.evaluate(20_000 * MS, 100 * MS),
+            ScrollDropDecision::Allow
+        );
+    }
+
+    #[test]
+    fn scroll_drop_gate_drops_subframe_bursts_without_advancing_window() {
+        let mut gate = ScrollDropGate::new();
+        assert_eq!(gate.evaluate(100 * MS, 100 * MS), ScrollDropDecision::Allow);
+        assert_eq!(
+            gate.evaluate(103 * MS, 103 * MS),
+            ScrollDropDecision::DropRateLimit(3 * MS)
+        );
+        assert_eq!(
+            gate.evaluate(107 * MS, 107 * MS),
+            ScrollDropDecision::DropRateLimit(7 * MS)
+        );
+        assert_eq!(gate.evaluate(108 * MS, 108 * MS), ScrollDropDecision::Allow);
+        assert_eq!(
+            gate.evaluate(112 * MS, 112 * MS),
+            ScrollDropDecision::DropRateLimit(4 * MS)
+        );
+        assert_eq!(gate.evaluate(116 * MS, 116 * MS), ScrollDropDecision::Allow);
+    }
 }

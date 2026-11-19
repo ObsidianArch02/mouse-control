@@ -125,6 +125,32 @@ pub(crate) fn has_per_app_scroll_profiles() -> bool {
     app_profile_flags() & FLAG_APP_SCROLL != 0
 }
 
+fn any_matches_per_app_scroll_profile_in<'a>(
+    cfg: &Config,
+    mut apps: impl Iterator<Item = &'a AppIdentity>,
+) -> bool {
+    apps.any(|app| {
+        cfg.mouse.profiles.iter().any(|p| {
+            (p.app_bundle_id.is_some() || p.app_name.is_some())
+                && (p.reverse_scroll.is_some()
+                    || p.scroll_mode.is_some()
+                    || p.line_count.is_some()
+                    || p.line_height.is_some())
+                && app_matches(p, Some(app))
+        })
+    })
+}
+
+pub(crate) fn any_matches_per_app_scroll_profile<'a>(
+    apps: impl Iterator<Item = &'a AppIdentity>,
+) -> bool {
+    if !has_per_app_scroll_profiles() {
+        return false;
+    }
+    let cfg = CONFIG.read().unwrap();
+    any_matches_per_app_scroll_profile_in(&cfg, apps)
+}
+
 pub(crate) fn has_per_device_profiles() -> bool {
     app_profile_flags() & FLAG_HAS_DEVICE != 0
 }
@@ -760,5 +786,37 @@ mod tests {
         assert_eq!(r.scroll_mode, ScrollMode::Default);
         assert_eq!(r.line_count, 6);
         assert!(!r.reverse_scroll);
+    }
+
+    #[test]
+    fn any_matches_per_app_scroll_profile_tracks_running_apps() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles.clear();
+        cfg.mouse.profiles.push(MouseProfile {
+            reverse_scroll: Some(true),
+            scroll_mode: Some("pixel".into()),
+            line_count: Some(4),
+            ..Default::default()
+        });
+        cfg.mouse.profiles.push(MouseProfile {
+            app_bundle_id: Some("com.apple.ScreenContinuity".into()),
+            scroll_mode: Some("continuous".into()),
+            ..Default::default()
+        });
+
+        let safari = safari_identity();
+        let continuity = AppIdentity {
+            bundle_id: Some("com.apple.ScreenContinuity".into()),
+            localized_name: Some("iPhone Mirroring".into()),
+        };
+
+        assert!(!any_matches_per_app_scroll_profile_in(
+            &cfg,
+            std::iter::once(&safari)
+        ));
+        assert!(any_matches_per_app_scroll_profile_in(
+            &cfg,
+            [&safari, &continuity].into_iter()
+        ));
     }
 }

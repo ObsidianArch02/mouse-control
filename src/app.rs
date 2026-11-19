@@ -15,14 +15,13 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const ACTIVATION_POLICY_PROHIBITED: isize = 2;
 const PID_MAP_MAX: usize = 512;
 const MAX_WINDOW_LAYER: i32 = 20;
-const WINDOW_SNAPSHOT_TTL: Duration = Duration::from_millis(3000);
 const POST_SWITCH_SETTLE_FIRST: Duration = Duration::from_millis(150);
 const POST_SWITCH_SETTLE_SECOND: Duration = Duration::from_millis(400);
 
@@ -52,7 +51,6 @@ struct WindowSnapshot {
     windows: Vec<WindowRect>,
     epoch: u64,
     config_gen: u64,
-    updated_at: Option<Instant>,
 }
 
 struct SnapSignalState {
@@ -114,18 +112,33 @@ static ACTIVE_SCROLL: std::sync::LazyLock<Mutex<crate::mouse::resolve::ResolvedS
 static PID_MAP: std::sync::LazyLock<Mutex<HashMap<i32, CachedApp>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static APP_EPOCH: AtomicU64 = AtomicU64::new(1);
+static NEED_WINDOW_SNAPSHOT: AtomicBool = AtomicBool::new(false);
 static WINDOW_SNAPSHOT: std::sync::LazyLock<Mutex<WindowSnapshot>> =
     std::sync::LazyLock::new(|| {
         Mutex::new(WindowSnapshot {
             windows: Vec::new(),
             epoch: 0,
             config_gen: 0,
-            updated_at: None,
         })
     });
 static SNAP_SIGNAL: Mutex<SnapSignalState> = Mutex::new(SnapSignalState::new());
 static SNAP_CV: Condvar = Condvar::new();
 static SNAP_WORKER: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn needs_cursor_window_lookup() -> bool {
+    NEED_WINDOW_SNAPSHOT.load(Ordering::Acquire)
+}
+
+fn update_need_window_snapshot() -> bool {
+    let needed = {
+        let map = PID_MAP.lock().unwrap();
+        crate::mouse::resolve::any_matches_per_app_scroll_profile(
+            map.values().map(|c| &c.identity),
+        )
+    };
+    NEED_WINDOW_SNAPSHOT.store(needed, Ordering::Release);
+    needed
+}
 
 pub(crate) fn active_identity() -> Option<AppIdentity> {
     ACTIVE_APP.lock().unwrap().clone()
@@ -138,7 +151,7 @@ pub(crate) fn active_scroll() -> crate::mouse::resolve::ResolvedScroll {
 pub(crate) fn refresh_scroll_cache() {
     let active = ACTIVE_APP.lock().unwrap().clone();
     *ACTIVE_SCROLL.lock().unwrap() = crate::mouse::resolve::resolve_scroll_for_app(active.as_ref());
-    if SNAP_WORKER.get().is_some() {
+    if update_need_window_snapshot() && SNAP_WORKER.get().is_some() {
         request_snapshot_refresh();
     }
 }
@@ -258,9 +271,7 @@ fn lookup_window_identity(
     current_epoch: u64,
     x: f64,
     y: f64,
-    now: Instant,
 ) -> (Option<AppIdentity>, bool) {
-
     if snap.epoch != current_epoch {
         return (None, true);
     }
@@ -269,10 +280,7 @@ fn lookup_window_identity(
         .iter()
         .find(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
         .map(|r| r.identity.clone());
-    let needs_refresh = snap
-        .updated_at
-        .is_none_or(|t| now.saturating_duration_since(t) >= WINDOW_SNAPSHOT_TTL);
-    (hit, needs_refresh)
+    (hit, false)
 }
 
 fn lookup_window_scroll(
@@ -281,7 +289,6 @@ fn lookup_window_scroll(
     current_cfg_gen: u64,
     x: f64,
     y: f64,
-    now: Instant,
 ) -> (Option<crate::mouse::resolve::ResolvedScroll>, bool) {
     if snap.epoch != current_epoch || snap.config_gen != current_cfg_gen {
         return (None, true);
@@ -291,10 +298,7 @@ fn lookup_window_scroll(
         .iter()
         .find(|r| x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1)
         .map(|r| r.scroll);
-    let needs_refresh = snap
-        .updated_at
-        .is_none_or(|t| now.saturating_duration_since(t) >= WINDOW_SNAPSHOT_TTL);
-    (hit, needs_refresh)
+    (hit, false)
 }
 
 unsafe fn lookup_or_query_pid(pid: i32) -> Option<CachedApp> {
@@ -414,6 +418,9 @@ fn ensure_snap_worker() {
                 drop(signal);
 
                 loop {
+                    if !NEED_WINDOW_SNAPSHOT.load(Ordering::Acquire) {
+                        break;
+                    }
                     let target_epoch = APP_EPOCH.load(Ordering::Acquire);
                     let target_cfg_gen = crate::mouse::resolve::config_generation();
                     let windows = autoreleasepool(|_| unsafe { capture_window_rects() });
@@ -422,7 +429,6 @@ fn ensure_snap_worker() {
                         snap.windows = windows;
                         snap.epoch = target_epoch;
                         snap.config_gen = target_cfg_gen;
-                        snap.updated_at = Some(Instant::now());
                     }
                     if APP_EPOCH.load(Ordering::Acquire) == target_epoch
                         && crate::mouse::resolve::config_generation() == target_cfg_gen
@@ -436,6 +442,9 @@ fn ensure_snap_worker() {
 }
 
 fn request_snapshot_refresh() {
+    if !NEED_WINDOW_SNAPSHOT.load(Ordering::Acquire) {
+        return;
+    }
     ensure_snap_worker();
     let mut signal = SNAP_SIGNAL.lock().unwrap();
     if signal.request_immediate() {
@@ -444,6 +453,9 @@ fn request_snapshot_refresh() {
 }
 
 fn request_post_switch_snapshot() {
+    if !NEED_WINDOW_SNAPSHOT.load(Ordering::Acquire) {
+        return;
+    }
     ensure_snap_worker();
     let mut signal = SNAP_SIGNAL.lock().unwrap();
     signal.request_post_switch(Instant::now());
@@ -451,10 +463,13 @@ fn request_post_switch_snapshot() {
 }
 
 pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
+    if !NEED_WINDOW_SNAPSHOT.load(Ordering::Acquire) {
+        return None;
+    }
     let current_epoch = APP_EPOCH.load(Ordering::Acquire);
     let (hit, needs_refresh) = {
         let snap = WINDOW_SNAPSHOT.lock().unwrap();
-        lookup_window_identity(&snap, current_epoch, x, y, Instant::now())
+        lookup_window_identity(&snap, current_epoch, x, y)
     };
     if needs_refresh {
         request_snapshot_refresh();
@@ -463,11 +478,14 @@ pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
 }
 
 pub(crate) fn scroll_at_point_or_active(x: f64, y: f64) -> crate::mouse::resolve::ResolvedScroll {
+    if !NEED_WINDOW_SNAPSHOT.load(Ordering::Acquire) {
+        return active_scroll();
+    }
     let current_epoch = APP_EPOCH.load(Ordering::Acquire);
     let current_cfg_gen = crate::mouse::resolve::config_generation();
     let (hit, needs_refresh) = {
         let snap = WINDOW_SNAPSHOT.lock().unwrap();
-        lookup_window_scroll(&snap, current_epoch, current_cfg_gen, x, y, Instant::now())
+        lookup_window_scroll(&snap, current_epoch, current_cfg_gen, x, y)
     };
     if needs_refresh {
         request_snapshot_refresh();
@@ -499,6 +517,7 @@ unsafe fn seed_pid_map() {
             map.insert(pid, entry);
         }
     });
+    update_need_window_snapshot();
 }
 
 unsafe fn read_dict_int(dict: *const c_void, key: *const c_void) -> Option<i32> {
@@ -572,6 +591,7 @@ extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, notification:
     if pid > 0 {
         PID_MAP.lock().unwrap().insert(pid, cached);
     }
+    update_need_window_snapshot();
     APP_EPOCH.fetch_add(1, Ordering::Release);
     request_post_switch_snapshot();
     if !set_active(identity) {
@@ -599,6 +619,7 @@ extern "C" fn handle_app_launch(_self: *mut c_void, _cmd: Sel, notification: *mu
     if let Some((pid, cached)) = entry {
         PID_MAP.lock().unwrap().insert(pid, cached);
     }
+    update_need_window_snapshot();
     APP_EPOCH.fetch_add(1, Ordering::Release);
     request_post_switch_snapshot();
 }
@@ -615,6 +636,7 @@ extern "C" fn handle_app_terminate(_self: *mut c_void, _cmd: Sel, notification: 
     if term_pid > 0 {
         PID_MAP.lock().unwrap().remove(&term_pid);
     }
+    update_need_window_snapshot();
     APP_EPOCH.fetch_add(1, Ordering::Release);
     request_post_switch_snapshot();
 }
@@ -752,8 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_window_identity_respects_epoch_z_order_and_ttl() {
-        let now = Instant::now();
+    fn lookup_window_identity_respects_epoch_config_gen_and_z_order() {
         let front = AppIdentity {
             bundle_id: Some("com.mitchellh.ghostty".to_string()),
             localized_name: Some("Ghostty".to_string()),
@@ -793,41 +814,33 @@ mod tests {
             ],
             epoch: 3,
             config_gen: 7,
-            updated_at: Some(now),
         };
 
+        assert_eq!(lookup_window_identity(&snap, 4, 200.0, 200.0), (None, true));
         assert_eq!(
-            lookup_window_identity(&snap, 4, 200.0, 200.0, now),
-            (None, true)
-        );
-        assert_eq!(
-            lookup_window_identity(&snap, 3, 200.0, 200.0, now),
+            lookup_window_identity(&snap, 3, 200.0, 200.0),
             (Some(front), false)
         );
         assert_eq!(
-            lookup_window_identity(&snap, 3, 50.0, 50.0, now),
-            (Some(back.clone()), false)
+            lookup_window_identity(&snap, 3, 50.0, 50.0),
+            (Some(back), false)
         );
         assert_eq!(
-            lookup_window_identity(&snap, 3, 1200.0, 1200.0, now),
+            lookup_window_identity(&snap, 3, 1200.0, 1200.0),
             (None, false)
-        );
-        assert_eq!(
-            lookup_window_identity(&snap, 3, 50.0, 50.0, now + WINDOW_SNAPSHOT_TTL),
-            (Some(back), true)
         );
 
         assert_eq!(
-            lookup_window_scroll(&snap, 3, 8, 200.0, 200.0, now),
+            lookup_window_scroll(&snap, 3, 8, 200.0, 200.0),
             (None, true)
         );
         assert_eq!(
-            lookup_window_scroll(&snap, 3, 7, 200.0, 200.0, now),
+            lookup_window_scroll(&snap, 3, 7, 200.0, 200.0),
             (Some(front_scroll), false)
         );
         assert_eq!(
-            lookup_window_scroll(&snap, 3, 7, 50.0, 50.0, now + WINDOW_SNAPSHOT_TTL),
-            (Some(back_scroll), true)
+            lookup_window_scroll(&snap, 3, 7, 50.0, 50.0),
+            (Some(back_scroll), false)
         );
     }
 
