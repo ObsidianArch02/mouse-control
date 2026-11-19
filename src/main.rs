@@ -9,7 +9,7 @@ mod service;
 
 use config::CONFIG;
 use ffi::*;
-use i18n::t;
+use i18n::{t, tf};
 use menu::*;
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
@@ -166,11 +166,24 @@ fn setup_status_bar() {
 }
 
 fn main() {
-
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(code) = service::dispatch(&args) {
-        std::process::exit(code);
+    let opts = match service::dispatch(&args) {
+        service::DispatchResult::Run(opts) => opts,
+        service::DispatchResult::Exit(code) => std::process::exit(code),
+    };
+
+    if let Some(path) = opts.config_path {
+        config::set_config_path_override(path);
     }
+
+    let _instance_lock = match service::acquire_instance_lock() {
+        Ok(lock) => lock,
+        Err(pid) => {
+            let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string());
+            eprintln!("{}", tf("service.already_running", &[("pid", &pid_str)]));
+            std::process::exit(0);
+        }
+    };
 
     init_app();
 
@@ -187,6 +200,7 @@ fn main() {
             &logger::LogConfig {
                 level,
                 file_path: cfg.logging.file_path.clone(),
+                log_stdout: opts.log_stdout,
             },
             is_dev,
         );
@@ -195,6 +209,7 @@ fn main() {
     drop(CONFIG.read().unwrap());
 
     setup_status_bar();
+    service::install_signal_handlers();
 
     app::start_monitor();
 
@@ -204,8 +219,10 @@ fn main() {
         let cfg = CONFIG.read().unwrap();
         let errs = cfg.validate();
         if !errs.is_empty() {
+            let cfg_path = config::resolved_config_path();
             log_info!(
-                "Config errors in ~/.config/mouse-control/config.toml ({} issue(s)):",
+                "Config errors in {} ({} issue(s)):",
+                cfg_path.display(),
                 errs.len()
             );
             for e in &errs {

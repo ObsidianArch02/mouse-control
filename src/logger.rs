@@ -25,6 +25,7 @@ impl LogLevel {
 pub struct LogConfig {
     pub level: LogLevel,
     pub file_path: String,
+    pub log_stdout: bool,
 }
 
 static LOG_TX: OnceLock<Sender<(LogLevel, String)>> = OnceLock::new();
@@ -76,8 +77,8 @@ pub fn init(config: &LogConfig, is_dev: bool) {
     LOG_TX.set(tx).ok();
     LOG_LEVEL.store(config.level as usize, Ordering::Relaxed);
 
-    let file_path = resolve_file_path(config);
-    std::thread::spawn(move || writer_loop(rx, is_dev, file_path));
+    let (write_stdout, file_path) = resolve_sink(config, is_dev);
+    std::thread::spawn(move || writer_loop(rx, write_stdout, file_path));
 }
 
 pub fn reconfigure(level: LogLevel) {
@@ -85,15 +86,15 @@ pub fn reconfigure(level: LogLevel) {
 }
 
 fn write_log_entry(
-    is_dev: bool,
+    stdout: &mut Option<BufWriter<std::io::Stdout>>,
     file: &mut Option<BufWriter<std::fs::File>>,
     level: LogLevel,
     msg: &str,
     flush_now: &mut bool,
     count: &mut usize,
 ) {
-    if is_dev {
-        print!("{}", msg);
+    if let Some(out) = stdout {
+        let _ = out.write_all(msg.as_bytes());
     }
     if let Some(f) = file {
         let _ = f.write_all(msg.as_bytes());
@@ -104,7 +105,9 @@ fn write_log_entry(
     }
 }
 
-fn writer_loop(rx: Receiver<(LogLevel, String)>, is_dev: bool, file_path: Option<String>) {
+fn writer_loop(rx: Receiver<(LogLevel, String)>, write_stdout: bool, file_path: Option<String>) {
+    let mut stdout: Option<BufWriter<std::io::Stdout>> =
+        write_stdout.then(|| BufWriter::new(std::io::stdout()));
     let mut file: Option<BufWriter<std::fs::File>> = file_path
         .and_then(|path| {
             OpenOptions::new()
@@ -112,7 +115,6 @@ fn writer_loop(rx: Receiver<(LogLevel, String)>, is_dev: bool, file_path: Option
                 .append(true)
                 .open(&path)
                 .map_err(|e| {
-
                     eprintln!("[logger] cannot open log file {}: {}", path, e);
                 })
                 .ok()
@@ -123,7 +125,7 @@ fn writer_loop(rx: Receiver<(LogLevel, String)>, is_dev: bool, file_path: Option
         let mut flush_now = false;
         let mut count = 0usize;
         write_log_entry(
-            is_dev,
+            &mut stdout,
             &mut file,
             first_level,
             &first_msg,
@@ -133,33 +135,70 @@ fn writer_loop(rx: Receiver<(LogLevel, String)>, is_dev: bool, file_path: Option
 
         while count < DEBUG_BATCH_MAX {
             match rx.try_recv() {
-                Ok((lvl, m)) => {
-                    write_log_entry(is_dev, &mut file, lvl, &m, &mut flush_now, &mut count)
-                }
+                Ok((lvl, m)) => write_log_entry(
+                    &mut stdout,
+                    &mut file,
+                    lvl,
+                    &m,
+                    &mut flush_now,
+                    &mut count,
+                ),
                 Err(_) => break,
             }
         }
 
         while !flush_now && count < DEBUG_BATCH_MAX {
             match rx.recv_timeout(DEBUG_FLUSH_DELAY) {
-                Ok((lvl, m)) => {
-                    write_log_entry(is_dev, &mut file, lvl, &m, &mut flush_now, &mut count)
-                }
+                Ok((lvl, m)) => write_log_entry(
+                    &mut stdout,
+                    &mut file,
+                    lvl,
+                    &m,
+                    &mut flush_now,
+                    &mut count,
+                ),
                 Err(_) => break,
             }
         }
 
+        if let Some(ref mut out) = stdout {
+            let _ = out.flush();
+        }
         if let Some(ref mut f) = file {
             let _ = f.flush();
         }
     }
 }
 
-fn resolve_file_path(config: &LogConfig) -> Option<String> {
+#[derive(Debug, PartialEq, Eq)]
+enum SinkTarget {
+    StdoutOnly,
+    ExplicitFile(String),
+    DefaultFile,
+}
 
-    if !config.file_path.is_empty() {
-        return Some(config.file_path.clone());
+fn classify_sink(file_path: &str, log_stdout: bool) -> SinkTarget {
+    if !file_path.is_empty() {
+        if file_path == "stdout" || file_path == "-" {
+            return SinkTarget::StdoutOnly;
+        }
+        return SinkTarget::ExplicitFile(file_path.to_string());
     }
+    if log_stdout {
+        return SinkTarget::StdoutOnly;
+    }
+    SinkTarget::DefaultFile
+}
+
+fn resolve_sink(config: &LogConfig, is_dev: bool) -> (bool, Option<String>) {
+    match classify_sink(&config.file_path, config.log_stdout) {
+        SinkTarget::StdoutOnly => (true, None),
+        SinkTarget::ExplicitFile(path) => (is_dev, Some(path)),
+        SinkTarget::DefaultFile => (is_dev, default_log_file_path()),
+    }
+}
+
+fn default_log_file_path() -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = format!("{}/Library/Logs/mouse-control", home);
     let _ = std::fs::create_dir_all(&dir);
@@ -256,5 +295,22 @@ fn file_timestamp() -> String {
             tm.tm_min,
             tm.tm_sec,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_sink_respects_file_path_then_log_stdout_then_default() {
+        assert_eq!(classify_sink("stdout", false), SinkTarget::StdoutOnly);
+        assert_eq!(classify_sink("-", false), SinkTarget::StdoutOnly);
+        assert_eq!(
+            classify_sink("/var/log/custom.log", true),
+            SinkTarget::ExplicitFile("/var/log/custom.log".to_string())
+        );
+        assert_eq!(classify_sink("", true), SinkTarget::StdoutOnly);
+        assert_eq!(classify_sink("", false), SinkTarget::DefaultFile);
     }
 }

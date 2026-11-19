@@ -12,33 +12,45 @@ mouse_line_count_invalid = "line_count: {value} 必須在 1..=20 之間"
 mouse_button_map_invalid = 'button_map: "{value}" 不是合法的按鍵動作(格式:[修飾鍵+]鍵名,如 "ctrl+left")'
 
 [service]
-usage = """mouse-control:選單列滑鼠增強(單一二進位檔,launchd 服務形態)
+usage = """mouse-control: macOS 選單列滑鼠增強(由 Homebrew Services 管理)
 
 用法:
-    mouse-control [run]          前台執行(顯示選單列圖示)
-    mouse-control install        安裝為 launchd 代理(登入時自動啟動)
-    mouse-control uninstall      停止並移除代理與已安裝的二進位檔
-    mouse-control status         檢視安裝、服務與簽署狀態
-    mouse-control --version      列印版本"""
-unknown_command = "未知指令:{cmd}"
+    mouse-control [run] [--config <path>] [--log-stdout]   前景執行
+    mouse-control status [--config <path>]                 檢視設定、服務、權限與簽署狀態
+    mouse-control sign [--identity <name>]                 使用本機鑰匙圈憑證重簽目前二進位檔
+    mouse-control --version                                列印版本
+
+服務管理:
+    brew services start mouse-control
+    brew services restart mouse-control
+    brew services stop mouse-control"""
+unknown_command = "未知指令或參數:{cmd}"
+missing_flag_value = "參數缺少值:{flag}"
+removed_install_cmd = "子指令 '{cmd}' 已移除，請改用 Homebrew 管理背景服務: brew services start|restart|stop mouse-control"
+already_running = "mouse-control 已在執行(pid {pid})，本次結束。"
 op_failed = "{action} 失敗:{error}"
-install_copy = "已安裝二進位檔:{path}"
-install_copy_skip = "已在安裝位置,原地重新簽署:{path}"
+sign_identity_missing = """鑰匙圈中未找到程式碼簽署憑證 "{identity}"。
+請一次性建立本機自簽程式碼簽署憑證:
+  1. 開啟「鑰匙圈存取」->「憑證輔助程式」->「製作憑證...」
+  2. 名稱填 {identity}
+  3. 身分類型選「自簽根憑證」，憑證類型選「程式碼簽署」
+  4. 在「登入」鑰匙圈點兩下該憑證 -> 展開「信任」->「程式碼簽署」改為「永遠信任」
+建立完成後執行: mouse-control sign --identity "{identity}" """
+sign_done = "已使用憑證 \"{identity}\" 簽署二進位檔:{path}"
+sign_restart_hint = "請重新啟動服務以套用: brew services restart mouse-control"
 sign_failed = "codesign 失敗:{error}"
-plist_written = "已寫入 LaunchAgent plist:{path}"
-agent_replaced = "已卸載先前載入的代理"
-agent_booted = "代理已載入並啟動:{label}"
-install_done = "安裝完成。每當缺少輔助使用權限(首次執行或重新安裝新建置後),啟動時都會彈出系統授權框;若「系統設定,隱私權與安全性,輔助使用」裡還留著舊的 mouse-control 條目,請先刪除再重新授權"
-not_installed = "未安裝({path} 下沒有 plist)"
-agent_not_loaded = "代理未處於載入狀態"
-uninstall_done = "已移除代理 {label}、plist 與已安裝的二進位檔"
-uninstall_kept = "保留了設定與記錄:{config_dir},{log_dir}"
 status_this = "目前二進位檔:{path}(v{version})"
-status_installed = "已安裝二進位檔:{path}({version})"
-status_installed_missing = "已安裝二進位檔:缺失(應在 {path})"
-status_plist = "launchd plist:{path}({state})"
+status_config = "設定檔:{path}({state})"
+status_instance_running = "執行實例:執行中(pid {pid})"
+status_instance_stopped = "執行實例:未執行"
+status_accessibility = "輔助使用權限:{state}"
+status_plist = "Homebrew plist:{path}({state})"
 state_present = "存在"
 state_missing = "缺失"
-status_loaded = "launchd:已載入,pid {pid},狀態 {state}"
-status_not_loaded = "launchd:未載入"
+state_granted = "已授權"
+status_loaded = "launchd ({label}):已載入，pid {pid}，狀態 {state}"
+status_not_loaded = "launchd ({label}):未載入"
+status_legacy_warning = "警告:偵測到舊版自裝代理({target}，{plist}，{bin})。請清理以避免雙實例衝突: launchctl bootout {target}; rm -f {plist} {bin}"
 status_requirement = "designated requirement:{req}"
+sign_mode_persistent = "簽署模式:憑證綁定(升級後可維持輔助使用授權)"
+sign_mode_adhoc = "簽署模式:ad-hoc cdhash 綁定(升級後輔助使用授權會失效，可執行 'mouse-control sign' 使用本機自簽憑證)"

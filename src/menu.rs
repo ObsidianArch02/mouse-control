@@ -85,7 +85,7 @@ pub(crate) extern "C" fn handle_mouse_enable_toggle(
     refresh_menu_titles();
 }
 
-pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+pub(crate) fn perform_reload_config() {
     let errs = reload_config();
     if errs.is_empty() {
         log_info!("Config reloaded successfully.");
@@ -107,13 +107,22 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
     refresh_menu_titles();
 }
 
-pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    log_info!("User quit via menu bar.");
+pub(crate) fn perform_graceful_shutdown(reason: &str) {
+    log_info!("{}", reason);
 
     buttons::release_all();
     buttons::flush();
+    mouse::stop();
     unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, terminate: std::ptr::null::<AnyObject>()];
     }
+}
+
+pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    perform_reload_config();
+}
+
+pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    perform_graceful_shutdown("User quit via menu bar.");
 }

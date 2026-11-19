@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 
 use crate::i18n::{self, tf};
+
+static CONFIG_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -244,11 +247,39 @@ fn sanitize_button_map(p: &MouseProfile) -> MouseProfile {
     p
 }
 
-fn config_path() -> std::path::PathBuf {
+pub fn set_config_path_override(path: PathBuf) {
+    let _ = CONFIG_PATH_OVERRIDE.set(path);
+}
+
+fn resolve_config_path_from(
+    override_path: Option<&PathBuf>,
+    xdg_config_home: Option<&str>,
+    home: &str,
+) -> PathBuf {
+    if let Some(path) = override_path {
+        return path.clone();
+    }
+    if let Some(xdg) = xdg_config_home.filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg).join("mouse-control").join("config.toml");
+    }
+    PathBuf::from(home)
+        .join(".config")
+        .join("mouse-control")
+        .join("config.toml")
+}
+
+pub fn resolved_config_path() -> PathBuf {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let dir = std::path::PathBuf::from(home).join(".config/mouse-control");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("config.toml")
+    resolve_config_path_from(CONFIG_PATH_OVERRIDE.get(), xdg.as_deref(), &home)
+}
+
+fn config_path() -> PathBuf {
+    let path = resolved_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    path
 }
 
 fn parse_and_sanitize_toml(content: &str) -> Result<(Config, Vec<String>, bool), String> {
@@ -723,6 +754,27 @@ line_height = 24
         assert_eq!(
             parsed.mouse.profiles[1].scroll_mode.as_deref(),
             Some("discrete")
+        );
+    }
+
+    #[test]
+    fn config_path_prefers_cli_override_then_xdg_then_home() {
+        let cli = PathBuf::from("/custom/mouse.toml");
+        assert_eq!(
+            resolve_config_path_from(Some(&cli), Some("/xdg"), "/Users/alice"),
+            PathBuf::from("/custom/mouse.toml")
+        );
+        assert_eq!(
+            resolve_config_path_from(None, Some("/Users/alice/.xdg"), "/Users/alice"),
+            PathBuf::from("/Users/alice/.xdg/mouse-control/config.toml")
+        );
+        assert_eq!(
+            resolve_config_path_from(None, Some(""), "/Users/alice"),
+            PathBuf::from("/Users/alice/.config/mouse-control/config.toml")
+        );
+        assert_eq!(
+            resolve_config_path_from(None, None, "/Users/alice"),
+            PathBuf::from("/Users/alice/.config/mouse-control/config.toml")
         );
     }
 }
