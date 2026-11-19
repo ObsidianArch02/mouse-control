@@ -6,13 +6,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
-// ========== 日志级别 / log level ==========
-
-/// 只有两档:Debug(调试细节)/ Info(常规运行信息)。
-/// 错误/警告统一走 log_info!(内容保留,不再单独分级)。
-///
-/// Only two levels: Debug (diagnostic detail) / Info (normal runtime info).
-/// Errors/warnings all go through log_info! (content preserved, no separate tiers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum LogLevel {
@@ -29,29 +22,18 @@ impl LogLevel {
     }
 }
 
-// ========== 配置 / config ==========
-
 pub struct LogConfig {
     pub level: LogLevel,
-    pub file_path: String, // 空=默认路径 / empty = default path
+    pub file_path: String,
 }
-
-// ========== 全局状态 / global state ==========
 
 static LOG_TX: OnceLock<Sender<(LogLevel, String)>> = OnceLock::new();
 static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Info as usize);
 
-// 有界通道容量:最坏约 100KB,远大于单次召唤的日志突发;仅在落盘严重卡顿时才会丢日志。
-// Bounded channel capacity: ~100KB worst case, far larger than a single summon's burst;
-// logs are dropped only when disk writes stall severely.
 const LOG_CHANNEL_CAPACITY: usize = 512;
 const DEBUG_FLUSH_DELAY: Duration = Duration::from_millis(100);
 const DEBUG_BATCH_MAX: usize = 64;
 
-// ========== 宏（调用侧接口） / macros (caller API) ==========
-
-/// 调试细节(每次事件/枚举/排序等),仅 Debug 档输出。
-/// Diagnostic detail (per-event / enumeration / sorting), emitted only at the Debug tier.
 #[macro_export]
 macro_rules! log_debug {
     ($($arg:tt)*) => {
@@ -60,8 +42,7 @@ macro_rules! log_debug {
         }
     };
 }
-/// 常规运行信息(启动/开关/菜单/错误提示等),Debug 与 Info 档均输出。
-/// Normal runtime info (startup / toggles / menu / error notices), emitted at both tiers.
+
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {
@@ -78,8 +59,6 @@ pub fn enabled(level: LogLevel) -> bool {
     level >= threshold
 }
 
-/// 被宏调用的核心函数：阈值过滤 + 拼时间戳 + 发送到 channel。
-/// Core function called by macros: threshold filter + timestamp + send to channel.
 pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
     if !enabled(level) {
         return;
@@ -87,19 +66,11 @@ pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
     if let Some(tx) = LOG_TX.get() {
         let ts = now_timestamp();
         let msg = format!("{} {} {}\n", ts, level.as_str(), args);
-        // 有界通道:满时丢弃最新日志,绝不阻塞调用线程(日志不应拖慢 UI/事件循环)。
-        // Bounded channel: drop the newest entry when full; never block the caller
-        // (logging must not stall the UI / event loop).
+
         let _ = tx.try_send((level, msg));
     }
 }
 
-// ========== 生命周期 / lifecycle ==========
-
-/// 在主线程早期调用，启动后台 writer 线程。
-/// Call early on the main thread to start the background writer thread.
-/// `is_dev`: target/ 下运行 → 同时输出 stdout;安装形态 → 只写文件 /
-/// running under target/ → also mirrors to stdout; installed form → file only.
 pub fn init(config: &LogConfig, is_dev: bool) {
     let (tx, rx) = flume::bounded::<(LogLevel, String)>(LOG_CHANNEL_CAPACITY);
     LOG_TX.set(tx).ok();
@@ -109,13 +80,9 @@ pub fn init(config: &LogConfig, is_dev: bool) {
     std::thread::spawn(move || writer_loop(rx, is_dev, file_path));
 }
 
-/// 运行时调整日志级别（reload_config 触发）。
-/// Runtime log level adjustment (triggered by reload_config).
 pub fn reconfigure(level: LogLevel) {
     LOG_LEVEL.store(level as usize, Ordering::Relaxed);
 }
-
-// ========== 内部实现 / internals ==========
 
 fn write_log_entry(
     is_dev: bool,
@@ -126,7 +93,7 @@ fn write_log_entry(
     count: &mut usize,
 ) {
     if is_dev {
-        print!("{}", msg); // stdout,msg 已含 \n / msg already contains \n
+        print!("{}", msg);
     }
     if let Some(ref mut f) = file {
         let _ = f.write_all(msg.as_bytes());
@@ -145,7 +112,7 @@ fn writer_loop(rx: Receiver<(LogLevel, String)>, is_dev: bool, file_path: Option
                 .append(true)
                 .open(&path)
                 .map_err(|e| {
-                    // writer 线程自身出问题时降级到 stderr / fallback to stderr on writer thread failure
+
                     eprintln!("[logger] cannot open log file {}: {}", path, e);
                 })
                 .ok()
@@ -173,8 +140,6 @@ fn writer_loop(rx: Receiver<(LogLevel, String)>, is_dev: bool, file_path: Option
             }
         }
 
-        // Debug 突发消息短时合并后再刷盘,降低高频事件下的系统态 flush 开销;Info 消息立即刷盘。
-        // Batch bursty Debug writes briefly before flushing while keeping Info writes immediate.
         while !flush_now && count < DEBUG_BATCH_MAX {
             match rx.recv_timeout(DEBUG_FLUSH_DELAY) {
                 Ok((lvl, m)) => {
@@ -191,36 +156,19 @@ fn writer_loop(rx: Receiver<(LogLevel, String)>, is_dev: bool, file_path: Option
 }
 
 fn resolve_file_path(config: &LogConfig) -> Option<String> {
-    // dev 模式也写文件:writer_loop 在 is_dev 时同时输出到 stdout 与文件,
-    // 便于开发时日志持久化(终端关闭不丢)。30 天清理同样作用于 dev 日志。
-    // Dev mode also writes to a file: writer_loop prints to stdout AND the file when is_dev,
-    // so dev logs persist (not lost when the terminal closes). The 30-day cleanup applies
-    // to dev logs too.
-    // 用户自定义路径:原样使用(append 模式,不加时间戳、不做清理,由用户自行管理轮转)。
-    // 我们不会往用户指定的位置写入额外文件,也不会删除其中的任何文件。
-    // User-supplied path: use verbatim (append mode, no timestamp, no cleanup - the user
-    // manages rotation themselves). We never write extra files into, or delete files from,
-    // a user-specified location.
+
     if !config.file_path.is_empty() {
         return Some(config.file_path.clone());
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = format!("{}/Library/Logs/mouse-control", home);
     let _ = std::fs::create_dir_all(&dir);
-    // 启动时清理 30 天前的旧日志(仅默认目录、仅 mouse-control-*.log)。
-    // Prune logs older than 30 days at startup (default dir only, mouse-control-*.log only).
+
     cleanup_old_logs(&dir);
     let stamp = file_timestamp();
     Some(format!("{}/mouse-control-{}.log", dir, stamp))
 }
 
-/// 删除日志目录中修改时间超过 30 天的 mouse-control-*.log 文件。
-/// 仅按 mtime 判断;正在写入的当前文件 mtime 持续更新,不会被误删。
-/// 仅作用于默认日志目录,不会触碰用户自定义路径所在的目录。
-///
-/// Delete mouse-control-*.log files in the log dir whose mtime is older than 30 days.
-/// Judged by mtime only; the current file's mtime keeps updating as we write, so it's never pruned.
-/// Only the default log dir is touched - never the directory of a user-supplied path.
 fn cleanup_old_logs(dir: &str) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -233,8 +181,7 @@ fn cleanup_old_logs(dir: &str) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // 只清理本应用产生的日志,避免误删同目录下的其他文件。
-        // Only touch our own logs; never delete unrelated files in the same dir.
+
         if !name.starts_with("mouse-control-") || !name.ends_with(".log") {
             continue;
         }
@@ -247,8 +194,6 @@ fn cleanup_old_logs(dir: &str) {
         }
     }
 }
-
-// ========== 时间戳 / timestamp ==========
 
 type TimeT = i64;
 
@@ -271,8 +216,6 @@ extern "C" {
     fn localtime_r(time: *const TimeT, result: *mut Tm) -> *mut Tm;
 }
 
-/// 零依赖 ISO-8601 时间戳，精确到毫秒。格式："2025-07-25T17:08:30.123"
-/// Zero-dep ISO-8601 timestamp with milliseconds.
 fn now_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -296,8 +239,6 @@ fn now_timestamp() -> String {
     }
 }
 
-/// 启动时间戳(文件名安全,无冒号),用于给本次运行的日志文件命名。
-/// Startup timestamp (filename-safe, no colons) used to name this run's log file.
 fn file_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

@@ -1,16 +1,7 @@
-//! FFI 与 ObjC 桥接的基础工具:CF 函数声明、裸指针的 Send/Sync 包装、NSString 转换。
-//! 被所有模块依赖,是叶子层(窗口切换器的颜色/图层 helper 已随切换器删除)。
-//!
-//! FFI and ObjC-bridging primitives: CF function declarations, Send/Sync wrappers for raw
-//! pointers, and NSString conversion. A leaf module (the switcher's color/layer helpers were
-//! removed with the switcher).
-
 use crate::log_info;
 use objc2::msg_send;
 use objc2::runtime::{AnyObject, Sel};
 use std::ffi::{c_char, c_void, CString};
-
-// ========== FFI 外部函数声明 / FFI extern declarations ==========
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -46,7 +37,6 @@ extern "C" {
     pub(crate) static kAXTrustedCheckOptionPrompt: *const c_void;
 }
 
-// AppKit 框架链接占位 / AppKit framework link placeholder
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {}
 
@@ -66,10 +56,6 @@ extern "C" {
     ) -> bool;
 }
 
-// ========== NSString / 对象生命周期 helper ==========
-
-/// 用 Rust &str 构造一个 NSString(CFStringCreateWithCString 返回 +1,调用方负责 release)。
-/// Build an NSString from a Rust &str (CFStringCreateWithCString returns +1; caller must release).
 pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {
     unsafe {
         let c_str = CString::new(s).unwrap();
@@ -81,8 +67,6 @@ pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {
     }
 }
 
-/// 把 NSString 转成 Rust String。
-/// Convert an NSString to a Rust String.
 pub(crate) unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
     if ns.is_null() {
         return String::new();
@@ -96,21 +80,10 @@ pub(crate) unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
         .into_owned()
 }
 
-/// 当前进程是否拥有辅助功能(AX)权限。
-/// Whether the current process has Accessibility permission.
 pub(crate) fn has_accessibility_permission() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
-/// 显式请求辅助功能权限:未授权时弹系统授权框(kAXTrustedCheckOptionPrompt=true)。
-/// 返回调用时刻是否已授权。ad-hoc 签名下重装新构建后旧授权条目会静默失效,弹窗会再次
-/// 出现,但列表里的旧条目仍显示开启,用户必须先删掉旧条目再重新授权(调用方负责在
-/// 日志里写明这一步)。
-/// Explicitly request Accessibility permission: shows the system prompt when untrusted
-/// (kAXTrustedCheckOptionPrompt=true). Returns whether the process is trusted at call time.
-/// After reinstalling a new ad-hoc-signed build the old grant silently stops matching, so the
-/// prompt reappears while the stale entry still looks enabled; the user must remove it and
-/// grant again (callers log that step).
 pub(crate) fn request_accessibility_permission() -> bool {
     unsafe {
         let keys: [*const c_void; 1] = [kAXTrustedCheckOptionPrompt];

@@ -1,16 +1,3 @@
-//! 鼠标事件 event tap。
-//! 在独立线程上建一个 default-tap 的 CGEventTap(HID 层),监听鼠标按键与滚轮事件。
-//! 滚轮事件根据配置分两种模式处理:默认(透传+反转)、按行(固定行数)。
-//! 两种模式统一使用合成事件方案:丢弃原始事件,合成新事件 post 到 session 层,
-//! 绕过系统自然滚动在 HID 层的覆盖。
-//!
-//! Mouse event tap.
-//! Spawns a default-tap CGEventTap (HID level) on a dedicated thread that listens for mouse
-//! button and scroll events. Scroll events are processed in one of two modes: Default
-//! (passthrough + optional reverse) or Line (fixed line count). Both use the synthetic-event
-//! approach: drop the original, post a new event to the session level, bypassing the system
-//! natural-scroll override at the HID layer.
-
 use crate::app::{self, AppIdentity};
 use crate::ffi::CFRelease;
 use crate::mouse::buttons;
@@ -33,25 +20,12 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
-// ========== 鼠标事件类型常量 / mouse event type constants ==========
-// 见 CGEventType.h。
-// See CGEventType.h.
 const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
 const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
 const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 
-// kCGMouseEventButtonNumber 字段(field 3)。注意不是 field 0(kCGMouseEventNumber,
-// 那是事件序号计数器,不是按钮号)。
-// kCGMouseEventButtonNumber field (field 3). Not field 0 (kCGMouseEventNumber is a
-// per-event-type sequence counter, not the button number).
 const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
 
-/// 把像素级滚动量转换成连续/像素滚动事件所需的整数 line 分量。
-/// 1 line = 10 pixels;不足 1 line 的非零滚动至少向上取整到 +/-1,与 CGEventCreateScrollWheelEvent2 一致。
-///
-/// Convert a pixel delta into the integer line component required by pixel/continuous scroll
-/// events. 1 line = 10 pixels; a non-zero delta smaller than one line rounds away from zero
-/// to +/-1, matching CGEventCreateScrollWheelEvent2.
 fn line_delta_from_point(point: i64) -> i64 {
     let line = point / 10;
     if point != 0 && line == 0 {
@@ -61,13 +35,6 @@ fn line_delta_from_point(point: i64) -> i64 {
     }
 }
 
-/// 原地改写滚轮 CGEvent 为精准像素事件(isContinuous=1, hasPreciseScrollingDeltas=true),
-/// 不创建新事件、不调用 CGEventPost,零 Mach IPC 往返。
-/// 注意字段写入顺序:先写 DeltaAxis 再写 PointDelta 与 FixedPtDelta(写 DeltaAxis 会重置后两者)。
-///
-/// Mutate a scroll CGEvent in place into a precise pixel event (isContinuous=1,
-/// hasPreciseScrollingDeltas=true) with zero CGEventPost Mach IPC.
-/// Field order matters: set DeltaAxis before PointDelta and FixedPtDelta.
 unsafe fn mutate_scroll_pixel_in_place(event: CGEventRef, point_dy: i64, point_dx: i64) {
     let line_dy = line_delta_from_point(point_dy);
     let line_dx = line_delta_from_point(point_dx);
@@ -89,10 +56,6 @@ unsafe fn mutate_scroll_pixel_in_place(event: CGEventRef, point_dy: i64, point_d
     CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, MOS_SYNTHETIC_MARKER);
 }
 
-/// 原地改写滚轮 CGEvent 为离散行事件(isContinuous=0, hasPreciseScrollingDeltas=false),
-/// 零 CGEventPost Mach IPC。
-/// Mutate a scroll CGEvent in place into a discrete line-unit event (isContinuous=0,
-/// hasPreciseScrollingDeltas=false) with zero CGEventPost Mach IPC.
 unsafe fn mutate_scroll_line_in_place(event: CGEventRef, dy: i32, dx: i32) {
     let dy64 = dy as i64;
     let dx64 = dx as i64;
@@ -124,8 +87,6 @@ unsafe fn apply_scroll_in_place(event: CGEventRef, dy: i32, dx: i32, unit: Scrol
     }
 }
 
-/// 把事件类型翻译成可读名称,便于日志阅读。
-/// Translate an event type into a readable name for log readability.
 fn event_type_name(t: CGEventType) -> &'static str {
     match t {
         K_CG_EVENT_OTHER_MOUSE_DOWN => "other down",
@@ -135,9 +96,6 @@ fn event_type_name(t: CGEventType) -> &'static str {
     }
 }
 
-/// 把 buttonNumber(0-based)翻译成可读名称,便于日志阅读。
-/// 0=左,1=右,2=中;3/4=标准 HID 后退/前进侧键;其余用裸数字。
-/// Translate buttonNumber (0-based) to a readable name for log readability.
 fn button_name(button: i64) -> String {
     match button {
         0 => "left".to_string(),
@@ -149,12 +107,6 @@ fn button_name(button: i64) -> String {
     }
 }
 
-/// 诊断日志:打印某个鼠标按键事件的 CG 按钮号 + 底层 IOHID 按钮字段/设备 sender。
-/// HID 层 tap 上 CG 按钮号可能不可靠,附带 IOHID 字段用于定位真实按钮。
-///
-/// Diagnostic log: print the CG button number of a mouse button event plus the underlying
-/// IOHID button fields/device sender. The CG button number can be unreliable on the HID-level
-/// tap, so the IOHID fields help locate the real button.
 fn log_button_event_diag(
     event_type: CGEventType,
     event: CGEventRef,
@@ -232,31 +184,23 @@ unsafe extern "C" fn mouse_event_tap_callback(
     }
 
     if event_type == K_CG_EVENT_SCROLL_WHEEL {
-        // 跳过自己或协调器标记的合成滚轮事件,避免重复处理。
-        // Skip synthetic scroll events carrying our marker or the Mos compatibility marker.
+
         let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
         if is_synthetic_scroll_marker(user_data) {
             return event;
         }
 
-        // continuous=1 表示连续(像素级)滚动事件,来自触摸板/Magic Mouse,直接放行。
-        // continuous=1 means a continuous (pixel-level) scroll event from a trackpad / Magic Mouse.
         let continuous = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS);
         if continuous != 0 {
             return event;
         }
 
-        // deltaAxis1 = 垂直滚动量,deltaAxis2 = 水平滚动量。
-        // deltaAxis1 = vertical delta, deltaAxis2 = horizontal delta.
         let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
         let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
 
         let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
         if !debug_enabled && !resolve::has_per_device_profiles() {
-            // 零分配、零 HashMap、零 CGEventPost 的快速热路径:直接复制预解析的 12B 滚动参数
-            // 并原地修改 CGEvent 返回,使回调稳定远低于 8000 Hz 轮询周期(125 us)。
-            // Zero-allocation, zero-HashMap, zero-CGEventPost fast path: copy pre-resolved scroll
-            // config and mutate the CGEvent in place to stay well below the 8000 Hz (125 us) budget.
+
             let scroll = if resolve::has_per_app_scroll_profiles() {
                 let loc = CGEventGetLocation(event);
                 app::scroll_at_point_or_active(loc.x, loc.y)
@@ -354,11 +298,6 @@ unsafe extern "C" fn mouse_event_tap_callback(
         let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
         log_button_event_diag(event_type, event, button, flags);
 
-        // 侧键映射:仅在配置了 per-device 档或开启 debug 日志时查询设备 sender,减少热路径开销;
-        // 命中 3/4 映射时合成键盘动作并丢弃原鼠标事件,未命中时原样透传(保持系统默认行为)。
-        // Side-button map: query the HID sender only when per-device profiles or debug logging need
-        // it; on a 3/4 mapping hit, synthesize the keyboard action and drop the original event;
-        // otherwise pass the event through unchanged.
         let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
             device::device_from_cgevent(event)
         } else {
@@ -391,13 +330,6 @@ unsafe extern "C" fn mouse_event_tap_callback(
     }
 }
 
-/// 鼠标事件线程的 RunLoop 引用,供 stop() 调 CFRunLoopStop。
-/// 由 start() 的线程在进入 CFRunLoopRun 前存入、结束后清空。
-/// 用 Send+Sync 包装的 Mutex(static 需要 Send+Sync,与 device.rs 的 ManagerMutex 同模式)。
-///
-/// The mouse thread's RunLoop reference, for stop() to call CFRunLoopStop on.
-/// Stored by the start() thread before CFRunLoopRun and cleared when it exits.
-/// Wrapped Mutex with Send+Sync (same pattern as device.rs's ManagerMutex; statics need it).
 struct RunLoopMutex(Mutex<Option<ffi::CFRunLoopRef>>);
 unsafe impl Send for RunLoopMutex {}
 unsafe impl Sync for RunLoopMutex {}
@@ -408,28 +340,12 @@ fn runloop_static() -> &'static Mutex<Option<ffi::CFRunLoopRef>> {
     &RUNLOOP.get_or_init(|| RunLoopMutex(Mutex::new(None))).0
 }
 
-/// 运行时停止请求标志:stop() 置位后,重试循环(thread::sleep 阻塞期)醒来即放弃,
-/// 避免 stop() 的 join() 在缺权限重试窗口期间阻塞调用线程。
-///
-/// Runtime stop request flag: once set by stop(), the retry loop (blocked in thread::sleep)
-/// bails out on wake-up, so stop()'s join() never blocks the caller during the missing-
-/// permission retry window.
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 运行时停止鼠标事件线程:置位取消标志 + CFRunLoopStop,线程自然结束。
-/// 幂等:未运行时无操作。由菜单/主流程在停用鼠标控制时调用。
-///
-/// Stop the mouse event thread at runtime: set the cancel flag + CFRunLoopStop, the thread
-/// exits naturally. Idempotent: no-op when not running. Called by the menu / main flow when
-/// mouse control is turned off.
 pub(crate) fn stop() {
-    // 释放所有按住的侧键目标键,防止 cmd/ctrl/opt/shift 卡住(停用/退出路径)。
-    // Release every held side-button target so modifiers like cmd/ctrl/opt/shift never
-    // get stuck on the disable/quit path.
+
     buttons::release_all();
-    // 先置位标志再停 RunLoop:重试窗口内线程醒来即可见(不依赖 RunLoop)。
-    // Set the flag first, then stop the RunLoop: during the retry window the thread sees the
-    // flag on wake-up (no RunLoop involved yet).
+
     STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
     let rl = runloop_static().lock().unwrap().take();
     if let Some(rl) = rl {
@@ -440,9 +356,6 @@ pub(crate) fn stop() {
     }
 }
 
-/// 启动鼠标事件监听线程。由 main.rs / 菜单在启用鼠标时调用。
-/// Start the mouse event listener thread. Called by main.rs / the menu when mouse control
-/// is enabled.
 pub(crate) fn start() -> thread::JoinHandle<()> {
     let mask: CGEventMask = (1u64 << K_CG_EVENT_OTHER_MOUSE_DOWN)
         | (1u64 << K_CG_EVENT_OTHER_MOUSE_UP)
@@ -458,12 +371,6 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             device::start_plug_monitor();
             device::ensure_enumerated();
 
-            // 挂在 Session 层(kCGSessionEventTap)并原地改写 CGEvent 返回:
-            // 1) 不阻塞 kCGHIDEventTap,避免高速滚轮后抢占或卡滞 8000 Hz 指针移动事件;
-            // 2) 位于系统自然滚动与 HID 加速之后、下游 Mos(AnnotatedSession) 之前,原地改写即可生效且零 CGEventPost IPC。
-            // Hook kCGSessionEventTap and mutate scroll CGEvents in place:
-            // 1) leaves kCGHIDEventTap unblocked so 8000 Hz mouseMoved never stalls behind scroll ticks;
-            // 2) runs after HID natural-scroll/acceleration and before Mos (AnnotatedSession) with zero CGEventPost IPC.
             let tap = ffi::create_tap_with_retry(
                 tap_location::SESSION_EVENT_TAP,
                 tap_placement::HEAD_INSERT,
@@ -490,18 +397,11 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             CURRENT_TAP.with(|c| c.set(tap));
             ffi::CGEventTapEnable(tap, true);
 
-            // 存入 RunLoop 供 stop() 使用;存入后再查一次停止标志,消除"存入后、run 前置位
-            // 标志"的竞态窗口(stop() 读 RUNLOOP 时要么读到 Some 而 CFRunLoopStop 有效,
-            // 要么读到 None 而线程的检查会拦截)。
-            // Store the RunLoop for stop(); re-check the stop flag after storing to close the race
-            // where the flag is set between the store and the run (stop() either reads Some and
-            // CFRunLoopStop works, or reads None and the thread's check catches it).
             crate::ffi::CFRetain(rl as *const c_void);
             *runloop_static().lock().unwrap() = Some(rl);
             if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
                 log_info!("Mouse event tap started.");
-                // 阻塞运行 RunLoop,直到 stop() 触发 CFRunLoopStop 或线程被终止。
-                // Block on the RunLoop until stop() fires CFRunLoopStop or the thread is killed.
+
                 ffi::CFRunLoopRun();
             }
             if let Some(r) = runloop_static().lock().unwrap().take() {

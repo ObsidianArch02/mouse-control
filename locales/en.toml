@@ -1,7 +1,3 @@
-# English locale (fallback). Keys are flattened with dot separators at load time,
-# e.g. [menu] enable_mouse  ->  "menu.enable_mouse".
-# Keep keys identical across locale files; only values differ.
-
 [menu]
 enable_mouse = "Enable Mouse Control"
 reload_config = "Reload Config"

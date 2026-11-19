@@ -10,11 +10,8 @@ enabled = true
 
 [[mouse.profiles]]
 reverse_scroll = true
-scroll_mode = "line"
+scroll_mode = "pixel"
 line_count = 3
-
-[mouse.profiles.pointer]
-disable_acceleration = true
 
 [mouse.profiles.button_map]
 3 = "ctrl+right"
@@ -24,10 +21,6 @@ disable_acceleration = true
 app_bundle_id = "com.apple.ScreenContinuity"
 scroll_mode = "continuous"
 
-# line_height:一行对应的像素量(1..=100),缺省用系统换算;仅 line 模式生效,
-# 配置后一次滚动 = line_count x line_height 像素。
-# line_height: pixels per line (1..=100), absent = the system's conversion;
-# line mode only, one notch = line_count x line_height pixels when set.
 [[mouse.profiles]]
 app_bundle_id = "com.apple.Notes"
 line_count = 2

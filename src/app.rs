@@ -1,12 +1,3 @@
-//! 前台 app 检测与缓存:per-app 配置覆盖的前置模块。
-//! 主线程维护一份当前前台 app 的稳定快照(初始读取 + NSWorkspace 通知更新),
-//! 鼠标事件线程只读取缓存,不在热路径上调用 AppKit。
-//!
-//! Frontmost-app detection and cache: the prerequisite for per-app config overrides.
-//! The main thread keeps a stable snapshot of the frontmost app (initial read + NSWorkspace
-//! notifications); the mouse event thread only reads the cache and never calls AppKit on the
-//! hot path.
-
 use crate::ffi::{
     class_addMethod, make_nsstring, nsstring_to_rust, objc_allocateClassPair,
     objc_registerClassPair, CFRelease,
@@ -35,11 +26,6 @@ const WINDOW_SNAPSHOT_TTL: Duration = Duration::from_millis(3000);
 const POST_SWITCH_SETTLE_FIRST: Duration = Duration::from_millis(150);
 const POST_SWITCH_SETTLE_SECOND: Duration = Duration::from_millis(400);
 
-/// 当前前台 app 的稳定身份。字段来自 NSRunningApplication;无 bundle 的小工具/脚本只有
-/// localized_name,两者都缺失时 per-app 档只会命中无 app 字段的全局/设备档。
-/// Stable identity for the current frontmost app. Fields come from NSRunningApplication;
-/// bundle-less utilities/scripts only have localized_name, and if both are missing per-app
-/// profiles are ignored in favor of profiles without an app matcher.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AppIdentity {
     pub(crate) bundle_id: Option<String>,
@@ -141,21 +127,14 @@ static SNAP_SIGNAL: Mutex<SnapSignalState> = Mutex::new(SnapSignalState::new());
 static SNAP_CV: Condvar = Condvar::new();
 static SNAP_WORKER: OnceLock<()> = OnceLock::new();
 
-/// 返回当前缓存的 app 身份。供鼠标线程 resolve 使用,只读 Mutex,不调用 AppKit。
-/// Return the cached app identity. Used by the mouse thread for resolution; read-only Mutex,
-/// no AppKit call.
 pub(crate) fn active_identity() -> Option<AppIdentity> {
     ACTIVE_APP.lock().unwrap().clone()
 }
 
-/// 返回当前前台 app 预解析好的滚轮参数(Copy,零堆分配)。
-/// Return the pre-resolved scroll config for the active app (Copy, zero heap allocation).
 pub(crate) fn active_scroll() -> crate::mouse::resolve::ResolvedScroll {
     *ACTIVE_SCROLL.lock().unwrap()
 }
 
-/// 配置重载时同步刷新前台 app 与窗口快照的预解析滚轮参数。
-/// Refresh pre-resolved scroll parameters after a config reload.
 pub(crate) fn refresh_scroll_cache() {
     let active = ACTIVE_APP.lock().unwrap().clone();
     *ACTIVE_SCROLL.lock().unwrap() = crate::mouse::resolve::resolve_scroll_for_app(active.as_ref());
@@ -195,12 +174,6 @@ unsafe fn app_from_notification(notification: *mut c_void) -> *mut AnyObject {
         return std::ptr::null_mut();
     }
 
-    // NSWorkspaceDidActivateApplicationNotification 的 userInfo 会带上真正被激活的
-    // NSRunningApplication。这里优先用通知里的 app,而不是重新查 frontmostApplication,
-    // 避免快速切 app 时 frontmostApplication 仍是旧值,导致 per-app 覆盖应用到错误目标。
-    // NSWorkspaceDidActivateApplicationNotification carries the app that actually activated.
-    // Prefer that over re-querying frontmostApplication, which can still be stale during
-    // rapid app switches and would apply per-app overrides to the wrong target.
     let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
     if user_info.is_null() {
         return std::ptr::null_mut();
@@ -246,9 +219,7 @@ fn should_include_window(
     height: f64,
     app: Option<&CachedApp>,
 ) -> bool {
-    // 排除桌面层(layer < 0)与 Dock/MenuBar 及以上系统层(layer >= 20),保留普通窗口与浮层。
-    // Exclude desktop windows (layer < 0) and Dock/MenuBar system layers (layer >= 20), keeping
-    // normal windows and popovers.
+
     if !(0..MAX_WINDOW_LAYER).contains(&layer) {
         return false;
     }
@@ -261,8 +232,7 @@ fn should_include_window(
     let Some(app) = app else {
         return false;
     };
-    // 跳过无界面后台/虚拟叠层(如 policy=2 的全屏透明驱动窗口)与 Dock。
-    // Skip prohibited background helpers (e.g., policy=2 fullscreen driver overlays) and Dock.
+
     if app.activation_policy == ACTIVATION_POLICY_PROHIBITED {
         return false;
     }
@@ -282,9 +252,7 @@ fn lookup_window_identity(
     y: f64,
     now: Instant,
 ) -> (Option<AppIdentity>, bool) {
-    // 切窗后快照代际滞后时直接返回 None,让调用方回退到已同步更新的前台 app,并触发刷新。
-    // When snapshot epoch lags behind the latest switch, return None so the caller falls back
-    // immediately to the updated frontmost app while triggering an async refresh.
+
     if snap.epoch != current_epoch {
         return (None, true);
     }
@@ -472,12 +440,6 @@ fn request_post_switch_snapshot() {
     SNAP_CV.notify_one();
 }
 
-/// 光标坐标处的 app 身份:只读内存窗口快照,不在 event tap 线程发起任何 AppKit/SkyLight IPC;
-/// 快照代际滞后或过期时仅唤醒后台 window-snap 线程异步刷新。
-///
-/// App identity at cursor coordinates: reads only the in-memory window snapshot with zero
-/// AppKit or SkyLight IPC on the event-tap thread, waking the background window-snap worker
-/// asynchronously when the snapshot epoch lags or TTL expires.
 pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
     let current_epoch = APP_EPOCH.load(Ordering::Acquire);
     let (hit, needs_refresh) = {
@@ -490,10 +452,6 @@ pub(crate) fn identity_at_point(x: f64, y: f64) -> Option<AppIdentity> {
     hit
 }
 
-/// 零堆分配滚轮热路径:直接从内存窗口快照复制预解析好的 ResolvedScroll,未命中或代际滞后时
-/// 立即回退到前台 app 的预解析参数。
-/// Zero-allocation scroll hot path: copies the pre-resolved ResolvedScroll directly from the
-/// in-memory window snapshot, falling back to the active app's pre-resolved config on miss.
 pub(crate) fn scroll_at_point_or_active(x: f64, y: f64) -> crate::mouse::resolve::ResolvedScroll {
     let current_epoch = APP_EPOCH.load(Ordering::Acquire);
     let current_cfg_gen = crate::mouse::resolve::config_generation();
@@ -533,9 +491,6 @@ unsafe fn seed_pid_map() {
     });
 }
 
-/// 从窗口 CFDictionary 读 i32 值(kCGWindowLayer / kCGWindowOwnerPID 都是 CFNumber)。
-/// Read an i32 value from a window CFDictionary (kCGWindowLayer / kCGWindowOwnerPID are
-/// both CFNumbers).
 unsafe fn read_dict_int(dict: *const c_void, key: *const c_void) -> Option<i32> {
     let value = CFDictionaryGetValue(dict, key);
     if value.is_null() {
@@ -549,8 +504,6 @@ unsafe fn read_dict_int(dict: *const c_void, key: *const c_void) -> Option<i32> 
     }
 }
 
-/// 从窗口 CFDictionary 读 f64 值(kCGWindowAlpha 是 CFNumber)。
-/// Read an f64 value from a window CFDictionary (kCGWindowAlpha is a CFNumber).
 unsafe fn read_dict_f64(dict: *const c_void, key: *const c_void) -> Option<f64> {
     let value = CFDictionaryGetValue(dict, key);
     if value.is_null() {
@@ -572,10 +525,6 @@ unsafe fn refresh_from_frontmost() -> AppIdentity {
     identity_from_running_app(frontmost_application())
 }
 
-/// 观察者目标保活。NSNotificationCenter 的 selector 式 observer 不 retain target,
-/// 与 menu target 同款问题:必须由我们显式 retain 并持有。
-/// Keeps the observer target alive. The selector-based NSNotificationCenter observer does not
-/// retain its target, mirroring the menu target: we must retain and own it explicitly.
 struct ObserverTarget(Mutex<Option<*mut AnyObject>>);
 unsafe impl Send for ObserverTarget {}
 unsafe impl Sync for ObserverTarget {}
@@ -589,9 +538,7 @@ fn observer_target() -> &'static Mutex<Option<*mut AnyObject>> {
 }
 
 extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, notification: *mut c_void) {
-    // 通知携带的 app 是权威值;极少数缺失 userInfo 的情况回退到 frontmostApplication。
-    // The app carried by the notification is authoritative; fall back only when its
-    // userInfo is missing.
+
     let (cached, pid) = unsafe {
         let app = app_from_notification(notification);
         if app.is_null() {
@@ -617,9 +564,7 @@ extern "C" fn handle_app_activation(_self: *mut c_void, _cmd: Sel, notification:
         return;
     }
     log_debug!("[app] frontmost app changed: {:?}", active_identity());
-    // 切 app 前先释放已按住的侧键目标键,避免旧 app 的 cmd/ctrl/opt/shift 卡在新 app。
-    // Release held side-button targets before the new app receives events, so modifiers from
-    // the old app never stick in the new app.
+
     crate::mouse::buttons::release_all();
 }
 
@@ -701,11 +646,6 @@ unsafe fn install_observer() {
     let _: *mut AnyObject = msg_send![target, retain];
     *observer_target().lock().unwrap() = Some(target);
 
-    // NSWorkspace 的通知必须订阅 NSWorkspace.sharedWorkspace.notificationCenter,
-    // 不能订阅 NSNotificationCenter.defaultCenter;否则 activation 通知根本收不到。
-    // NSWorkspace notifications must be observed on
-    // NSWorkspace.sharedWorkspace.notificationCenter, not the default notification center;
-    // otherwise the activation notifications never arrive.
     let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
     let center: *mut AnyObject = msg_send![workspace, notificationCenter];
     for (notif_name, selector) in [
@@ -735,9 +675,6 @@ unsafe fn install_observer() {
     log_info!("[app] active-app notification observer installed.");
 }
 
-/// 主线程启动时调用一次:初始化当前前台 app,并注册后续激活通知。
-/// Called once on the main thread at startup: initializes the current frontmost app and
-/// registers the activation observer.
 pub(crate) fn start_monitor() {
     unsafe {
         seed_pid_map();

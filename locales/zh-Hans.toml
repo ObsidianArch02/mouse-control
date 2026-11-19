@@ -1,5 +1,3 @@
-# 简体中文。键名与 en.toml 保持一致,只改文案。
-
 [menu]
 enable_mouse = "启用鼠标控制"
 reload_config = "重载配置"

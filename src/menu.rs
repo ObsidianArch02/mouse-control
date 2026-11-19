@@ -1,11 +1,3 @@
-//! 状态栏菜单:启用/停用鼠标控制、重载配置、退出。
-//! 菜单项状态(MOUSE_ENABLE_ITEM / FIXED_MENU_ITEMS)、动作回调与标题刷新;
-//! setup_status_bar 留在 main.rs(装配代码)。
-//!
-//! Status bar menu: enable/disable mouse control, reload config, quit.
-//! Menu-item state (MOUSE_ENABLE_ITEM / FIXED_MENU_ITEMS), action callbacks, and title
-//! refresh; setup_status_bar stays in main.rs (wiring).
-
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send};
 use std::ffi::c_void;
@@ -19,20 +11,14 @@ use crate::mouse;
 use crate::mouse::buttons;
 use crate::mouse::resolve;
 
-// ========== 菜单项状态 / menu-item state ==========
-
 pub(crate) struct MenuItemState {
     pub(crate) item: *mut AnyObject,
 }
 unsafe impl Send for MenuItemState {}
 unsafe impl Sync for MenuItemState {}
 
-/// "启用鼠标控制"开关项(勾选态)。
-/// The "Enable Mouse Control" toggle item (checkmark state).
 pub(crate) static MOUSE_ENABLE_ITEM: Mutex<Option<MenuItemState>> = Mutex::new(None);
 
-// 固定标题的菜单项(reload / quit)。locale 变更时由 refresh_menu_titles 批量重设标题。
-// Fixed-title menu items (reload / quit); re-titled in bulk by refresh_menu_titles on locale change.
 pub(crate) struct FixedMenuItems {
     pub(crate) reload: *mut AnyObject,
     pub(crate) quit: *mut AnyObject,
@@ -41,11 +27,6 @@ unsafe impl Send for FixedMenuItems {}
 unsafe impl Sync for FixedMenuItems {}
 pub(crate) static FIXED_MENU_ITEMS: Mutex<Option<FixedMenuItems>> = Mutex::new(None);
 
-// ========== 菜单动作 / menu actions ==========
-
-/// 用当前 locale 与启用状态重设全部菜单项标题/勾选。用于 locale 变更(reload)与启动时修正。
-/// Re-title all menu items and sync the enable checkmark from the current locale and state.
-/// Used on locale change (reload) and at startup to fix initial labels.
 pub(crate) fn refresh_menu_titles() {
     unsafe {
         let enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
@@ -53,7 +34,7 @@ pub(crate) fn refresh_menu_titles() {
             let ns_title = make_nsstring(&t("menu.enable_mouse"));
             let _: () = msg_send![s.item, setTitle: ns_title];
             CFRelease(ns_title as *const c_void);
-            // NSControlStateValueOn = 1, Off = 0
+
             let state: isize = if enabled { 1 } else { 0 };
             let _: () = msg_send![s.item, setState: state];
         }
@@ -70,9 +51,6 @@ pub(crate) fn refresh_menu_titles() {
     }
 }
 
-/// 启用/停用鼠标控制:翻转配置并写盘,热启停事件 tap 与指针设置。
-/// Toggle mouse control: flip the config and persist it, then hot start/stop the event tap
-/// and pointer settings.
 pub(crate) extern "C" fn handle_mouse_enable_toggle(
     _self: *mut c_void,
     _cmd: Sel,
@@ -88,9 +66,7 @@ pub(crate) extern "C" fn handle_mouse_enable_toggle(
     }
     resolve::invalidate_cache();
     if enable {
-        // 启用时若缺辅助功能权限,显式弹系统授权框提醒用户;重装后的旧授权条目需先删除。
-        // When enabling without Accessibility, explicitly raise the system prompt to remind the
-        // user; a stale entry from a previous build must be removed first.
+
         if !has_accessibility_permission() {
             request_accessibility_permission();
             log_info!(
@@ -109,10 +85,6 @@ pub(crate) extern "C" fn handle_mouse_enable_toggle(
     refresh_menu_titles();
 }
 
-/// 重载配置文件:应用新配置(locale/日志级别),失效设备解析缓存,并按 enabled 热启停事件 tap。
-///
-/// Reload the config file: apply it (locale/log level), invalidate the device-resolution
-/// cache, and hot start/stop the event tap per `enabled`.
 pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     let errs = reload_config();
     if errs.is_empty() {
@@ -123,9 +95,7 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
             log_info!("  • {}", e);
         }
     }
-    // 配置可能已变化:先释放按住的侧键目标键,再失效解析缓存。
-    // Config may have changed: release any held side-button actions (so cmd/ctrl/opt/shift
-    // never stick after a reload) and invalidate the resolve cache.
+
     buttons::release_all();
     resolve::invalidate_cache();
     let enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
@@ -139,9 +109,7 @@ pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _se
 
 pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     log_info!("User quit via menu bar.");
-    // 退出前释放按住的侧键目标键,避免 cmd/ctrl/opt/shift 在退出后卡住。
-    // Release held side-button targets before quitting so modifiers like cmd/ctrl/opt/shift
-    // never stay stuck after the app exits.
+
     buttons::release_all();
     buttons::flush();
     unsafe {

@@ -1,5 +1,3 @@
-# 繁體中文。鍵名與 en.toml 保持一致,只改文案。
-
 [menu]
 enable_mouse = "啟用滑鼠控制"
 reload_config = "重新載入設定"

@@ -1,179 +1,95 @@
 # mouse-control
 
-A minimal macOS menu-bar app that enhances your mouse. It is a stripped-down extract of the
-mouse-control features from [oh-my-tab](https://github.com/eacryo/oh-my-tab), keeping only the
-mouse functionality with no window switcher and no settings window.
+A macOS menu bar utility for scroll direction, unified scroll travel, and mouse side button remapping.
 
-It is pure Rust calling AppKit / CoreGraphics / IOKit directly through `objc2` FFI — no Swift
-bridge, no UI framework, no Dock icon.
+[Install](#install) | [Configuration](#configuration) | [License](LICENSE)
 
-It ships as a **single unbundled binary** with no `.app` packaging: the binary registers
-itself as a launchd LaunchAgent (auto-start at login, restart on crash) and still shows the
-menu-bar icon, because the agent runs inside the user's GUI session.
+Requirements: macOS on Apple Silicon (`aarch64-apple-darwin`) and Accessibility permission.
 
 ## Features
 
-- **Reverse scrolling** — flip the wheel direction relative to the system's current setting.
-- **Unified pixel scrolling (`pixel`)** — emit precise pixel-unit events (`line_count × line_height`, default `20 pt` per line) so each notch bypasses per-app discrete multipliers (such as Ghostty `discrete:3`, Kitty `5.0`, or Chromium's 40 px step).
-- **Discrete line scrolling (`discrete` / `line`)** — emit discrete line-unit wheel ticks as a fallback for apps that expect non-precise mouse wheel events (`discrete` always uses line units and ignores inherited `line_height`).
-- **Continuous scrolling (`continuous`)** — emit trackpad-style pixel scroll events for apps that behave poorly with discrete wheel events (for example iPhone Mirroring).
-- **Side-button remapping** — map side buttons (3/4) to keyboard shortcuts or media keys
-  (e.g. `3 = "ctrl+left"` for browser back). Holding the button presses the target, releasing
-  it releases; no auto-repeat.
-- **Per-device profiles** — match devices by VID+PID; each device can have its own settings,
-  merged over an "All Mice" default profile (more specific profiles win).
-- **Per-app overrides** — add `app_bundle_id` or `app_name` to a profile so it applies to
-  that app; a combined device + app profile overrides both device-only and app-only
-  profiles. Scroll events are attributed to the app owning the **window under the cursor**
-  (falling back to the frontmost app), so a per-app profile also applies when you scroll an
-  unfocused window of that app without activating it first.
-- **Hot toggle & hot reload** — enable/disable from the menu (persisted to config), or edit
-  the TOML and choose *Reload Config*; no restart needed.
-- **Bluetooth resilience** — device plug/unplug is monitored on a dedicated HID run loop, so
-  the attribution chain recovers automatically after a Bluetooth disconnect/reconnect.
-- **No pointer acceleration intervention** — pointer tracking is left untouched for native
-  macOS system settings. Legacy `[mouse.profiles.pointer]` blocks remain accepted in TOML
-  and ignored at runtime.
+- Reverse scrolling relative to the macOS scroll direction setting.
+- Unified pixel scroll mode (`pixel`) that emits precise pixel events (`line_count * line_height`, default `20` points per line) to bypass per app discrete multipliers.
+- Discrete fallback mode (`discrete`) that emits line unit wheel ticks and ignores inherited `line_height`.
+- Continuous mode (`continuous`) for trackpad style scrolling in apps such as iPhone Mirroring.
+- Side button remapping (`3` and `4`) to keyboard shortcuts or media keys.
+- Per device (`device_vendor_id`, `device_product_id`) and per app (`app_bundle_id`, `app_name`) profiles resolved against the window under the cursor.
+- In place `CGEvent` mutation on `kCGSessionEventTap` with no pointer acceleration intervention.
 
-## Requirements
+## Install
 
-- macOS on Apple Silicon (`aarch64-apple-darwin`).
-- **Accessibility** permission for the app. The HID-level event tap needs it to modify/drop
-  events. Without it the app logs a retry notice and keeps running; grant it under
-  System Settings → Privacy & Security → Accessibility.
-
-## Build & run
+Build from source and install as a launchd LaunchAgent:
 
 ```sh
-cargo check   # fast type-check
-cargo test    # unit tests (profile resolution + scroll direction)
-cargo run     # build + run (takes over the mouse event tap)
-```
-
-## Run as a login service
-
-The binary installs itself as a launchd LaunchAgent:
-
-```sh
-cargo build --release
+cargo test --locked
+cargo build --release --locked
 ./target/release/mouse-control install
 ```
 
-`install` copies the binary to `~/.local/bin/mouse-control`, ad-hoc signs it, writes
-`~/Library/LaunchAgents/com.eacryo.mouse-control.plist`, and bootstraps the agent (an already
-loaded agent is unloaded first, so `install` doubles as the redeploy/restart path). Companion
-subcommands: `status` prints install/service/signing state, `uninstall` stops the agent and
-removes the plist and installed binary (config and logs are kept), `--help` prints usage.
-Running the binary with no arguments behaves exactly like before: foreground process with the
-menu-bar icon.
+Subcommands:
 
-The agent loads only in GUI sessions and restarts on crash; a menu Quit exits cleanly and
-stays off until the next login or `launchctl kickstart gui/$(id -u)/com.eacryo.mouse-control`.
-launchd's stdout/stderr land in `~/Library/Logs/mouse-control/launchd-{stdout,stderr}.log`.
+- `mouse-control [run]`: run in the foreground with the menu bar icon.
+- `mouse-control install`: copy the binary to `~/.local/bin/mouse-control`, ad hoc sign it, and load the LaunchAgent.
+- `mouse-control status`: print install, service, and signing state.
+- `mouse-control uninstall`: unload the agent and remove the plist and installed binary.
 
-**Accessibility permission.** Whenever the app finds itself untrusted (first launch, or after
-`install` redeploys a new build: the ad-hoc signature pins the grant to the build's cdhash, so
-the old grant silently stops matching), it raises the system permission prompt, both at launch
-and when you enable mouse control from the menu. A stale entry from a previous build still
-appears enabled under System Settings → Privacy & Security → Accessibility; remove it, then
-grant again from the prompt. The event tap retries for about two minutes, so granting takes
-effect without relaunching. `mouse-control status` shows the current designated requirement.
+Grant Accessibility permission under System Settings, Privacy & Security, Accessibility. After installing a new build, remove the previous `mouse-control` entry before granting permission again.
 
 ## Configuration
 
-Config lives at `~/.config/mouse-control/config.toml` (auto-created with Windows-style
-defaults on first run: reverse scrolling, Line mode, 1:1 tracking, and side-button desktop
-switching). The schema:
+The configuration file lives at `~/.config/mouse-control/config.toml`:
 
 ```toml
+[logging]
+level = "info"
+file_path = ""
+
+[i18n]
+locale = "auto"
+
 [mouse]
 enabled = true
 
-[[mouse.profiles]]              # no device fields = "All Mice" default profile
-reverse_scroll = true           # Windows-style: reverse relative to the system direction
-scroll_mode = "pixel"           # "default" | "line" | "pixel" | "discrete" | "continuous"
-line_count = 3                  # lines per notch (1..=20)
-button_map = { "3" = "ctrl+left", "4" = "ctrl+right" }  # side buttons: desktop left/right
+[[mouse.profiles]]
+reverse_scroll = true
+scroll_mode = "pixel"
+line_count = 3
 
-[[mouse.profiles]]              # optional per-device override profile
-device_vendor_id = 1133
-device_product_id = 50475
-reverse_scroll = false
-button_map = { "4" = "cmd+[" }  # side-button actions: "3"/"4" -> [modifier+]key
+[mouse.profiles.button_map]
+3 = "ctrl+right"
+4 = "ctrl+left"
 
-[[mouse.profiles]]              # optional per-app override profile
-app_bundle_id = "com.apple.Safari"
-reverse_scroll = false
-button_map = { "3" = "cmd+[" }
-
-[[mouse.profiles]]              # per-app continuous scrolling for iPhone Mirroring
+[[mouse.profiles]]
 app_bundle_id = "com.apple.ScreenContinuity"
 scroll_mode = "continuous"
 
-[[mouse.profiles]]              # per-app example: Notes needs more travel per notch
+[[mouse.profiles]]
+app_bundle_id = "com.mitchellh.ghostty"
+scroll_mode = "pixel"
+line_count = 1
+
+[[mouse.profiles]]
 app_bundle_id = "com.apple.Notes"
 line_count = 2
-line_height = 24                # pixels per line (1..=100); line mode only
-
-[[mouse.profiles]]              # optional app + device override profile
-app_name = "Google Chrome"
-device_vendor_id = 1133
-device_product_id = 50475
-line_count = 5
+line_height = 24
 ```
 
-Merge semantics: a profile applies only when both its device matcher and app matcher match.
-Specificity decides precedence first, then file order. A global profile has specificity 0, a
-device-only or app-only profile has specificity 1, and a profile with both device and app
-fields has specificity 2. Higher specificity overrides lower specificity; among profiles with
-the same specificity, later profiles win per field. A profile without
-`device_vendor_id`/`device_product_id` matches every mouse, and one without
-`app_bundle_id`/`app_name` matches every app. `app_bundle_id` matches the running app's bundle
-identifier exactly; `app_name` matches its localized name exactly; if both are present, either
-may match. Invalid fields (bad `scroll_mode`, `line_count` out of range) are reset to defaults
-with a logged error — the app never refuses to start. To find a device's VID:PID, enable debug
-logging and watch the `[mouse] scroll dev=` line in the log, or use
-`system_profiler SPUSBDataType`.
+Scroll modes:
 
-`line_height` (absent by default, valid range 1..=100) customizes how many points one line
-covers when emitting precise pixel events (`kCGScrollEventUnitPixel`, which sets
-`hasPreciseScrollingDeltas = true`). In `pixel` mode, each notch emits
-`line_count × line_height` points (defaulting `line_height` to `20` when omitted). In
-`discrete` mode, each notch always emits `line_count` discrete line units and ignores any
-inherited `line_height`. In legacy `line` mode, setting `line_height` switches to pixel
-units while omitting it emits discrete line units.
+- `pixel`: emits `kCGScrollEventUnitPixel` (`line_count * line_height`, default `line_height = 20`).
+- `discrete`: emits `kCGScrollEventUnitLine` (`line_count` ticks, ignoring inherited `line_height`).
+- `continuous`: emits continuous pixel deltas from the raw event with optional reversal.
+- `line`: legacy mode (`kCGScrollEventUnitPixel` when `line_height` is set, `kCGScrollEventUnitLine` when absent).
+- `default`: passes raw wheel deltas through with optional reversal.
 
-### Side-button actions (`button_map`)
-
-Each profile can map side buttons to keyboard actions. Button numbers are the HID button
-numbers: `3` = back, `4` = forward (only these two are supported in v1). The action syntax
-is `[modifier+]key`, case-insensitive:
-
-```toml
-button_map = { "3" = "ctrl+left", "4" = "ctrl+right" }   # browser back/forward
-button_map = { "4" = "cmd+[" }                            # per-device override
-```
-
-Modifiers: `cmd`/`command`, `ctrl`/`control`, `opt`/`option`/`alt`, `shift`. A lone modifier
-is valid too, so a side button can be held as a modifier (e.g. `"3" = "cmd"`). Common keys:
-letters, digits, and US-layout punctuation (`[`, `]`, `;`, `'`, `,`, `.`, `/`, `-`, `=`,
-backtick, `\`), arrows (`left`/`right`/`up`/`down`), `home`/`end`/`page_up`/`page_down`/
-`space`/`return`/`tab`/`esc`/`delete`/`forward_delete`, `caps_lock`, `f1`–`f20`, plus
-media/system keys `volume_up`, `volume_down`, `mute`, `brightness_up`, `brightness_down`,
-`play_pause`, `next_track`, `prev_track`, `mission_control`, `launchpad`. The literal `+`
-key is written `plus`.
-
-Semantics: holding the side button presses the target key; releasing it releases the target
-(no auto-repeat). A mapped button replaces the original side-button event; unmapped buttons
-pass through untouched. An invalid action is dropped with a logged error and never takes down
-the rest of the profile.
-
-Logs go to `~/Library/Logs/mouse-control/mouse-control-<timestamp>.log` (30-day retention);
-`cargo run` also mirrors them to stdout.
+Profile merge precedence uses specificity first (global, then device only or app only, then device plus app) and file order within the same tier.
 
 ## Menu
 
-- **Enable Mouse Control** — hot start/stop (checkmark shows the state; persisted to config).
-- **Reload Config** — re-read the TOML, invalidate the resolution cache, and hot start/stop
-  the event tap.
-- **Quit** — releases any held side-button keys before exiting.
+- Enable Mouse Control: toggle the event tap at runtime and persist `mouse.enabled`.
+- Reload Config: reload `~/.config/mouse-control/config.toml` and clear resolution caches.
+- Quit: release held side button keys and exit.
+
+## License
+
+See [LICENSE](LICENSE).
