@@ -22,6 +22,8 @@ Follow these steps in order to install, sign, and start `mouse-control` as a Hom
 
 ### 1. Add the Homebrew tap and install
 
+Use Homebrew 6.0.16 or later.
+
 ```sh
 brew tap ObsidianArch02/tap
 brew install mouse-control
@@ -40,7 +42,7 @@ macOS binds Accessibility permission to the binary's code-signing requirement. T
 mouse-control sign
 ```
 
-Future `brew upgrade mouse-control` runs sign automatically in `post_install` whenever the login keychain is unlocked. You can skip this step to test immediately, but macOS will reset Accessibility permission after each upgrade.
+During an upgrade, Homebrew signs the new binary if the signing identity is available. If signing fails or the identity is unavailable, unlock the login keychain and run `mouse-control sign` before you restart the service.
 
 ### 3. Start the service and grant Accessibility permission
 

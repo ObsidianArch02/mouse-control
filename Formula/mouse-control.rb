@@ -14,13 +14,16 @@ class MouseControl < Formula
     pkgshare.install "config.toml"
   end
 
-  def post_install
-    identity = ENV.fetch("MOUSE_CONTROL_CODESIGN_IDENTITY", "mouse-control-codesign")
-    identities = Utils.popen_read("/usr/bin/security", "find-identity", "-v", "-p", "codesigning")
-    return unless identities.include?(%("#{identity}"))
-
-    quiet_system "/usr/bin/codesign", "--force", "--sign", identity,
-                 "--identifier", "com.eacryo.mouse-control", (bin/"mouse-control").to_s
+  post_install_steps do
+    run "/bin/sh", args: ["-c", <<~'SH', "sign-mouse-control", "{{bin}}/mouse-control"], must_succeed: false
+      identity=${MOUSE_CONTROL_CODESIGN_IDENTITY-mouse-control-codesign}
+      identities=$(/usr/bin/security find-identity -v -p codesigning) || exit $?
+      case "$identities" in
+        *"\"$identity\""*)
+          exec /usr/bin/codesign --force --sign "$identity" --identifier com.eacryo.mouse-control "$1"
+          ;;
+      esac
+    SH
   end
 
   service do
