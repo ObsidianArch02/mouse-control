@@ -44,19 +44,23 @@ pub(crate) enum KeyAction {
 }
 
 pub(crate) fn parse_action(raw: &str) -> Option<PressedKey> {
-    let s = raw.trim().to_ascii_lowercase();
+    let s = raw.trim();
+    let lowercase;
+    let s = if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        lowercase = s.to_ascii_lowercase();
+        lowercase.as_str()
+    } else {
+        s
+    };
     if s.is_empty() {
         return None;
     }
-    let parts: Vec<&str> = s.split('+').map(str::trim).collect();
-
-    if parts.iter().any(|p| p.is_empty()) {
-        return None;
-    }
+    let mut parts = s.split('+').map(str::trim);
+    let last = parts.next_back()?;
 
     let mut modifiers: CGEventFlags = 0;
     let mut seen = [false; 4];
-    for p in &parts[..parts.len() - 1] {
+    for p in parts {
         let (flag, idx) = modifier(p)?;
 
         if seen[idx] {
@@ -65,8 +69,6 @@ pub(crate) fn parse_action(raw: &str) -> Option<PressedKey> {
         seen[idx] = true;
         modifiers |= flag;
     }
-
-    let last = parts[parts.len() - 1];
 
     if let Some((_, idx)) = modifier(last) {
         if seen[idx] {

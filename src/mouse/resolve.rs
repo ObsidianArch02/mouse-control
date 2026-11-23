@@ -225,20 +225,16 @@ pub(crate) fn resolve(device: Option<DeviceKey>, app: Option<AppIdentity>) -> Ar
     r
 }
 
+pub(crate) fn supports_button(button: u32) -> bool {
+    matches!(button, 3 | 4)
+}
+
 fn resolve_from(
     cfg: &Config,
     device: Option<DeviceKey>,
     app: Option<&AppIdentity>,
 ) -> ResolvedMouse {
     let mut r = ResolvedMouse::default();
-
-    let defaults = ResolvedMouse::default();
-    r.reverse_scroll = defaults.reverse_scroll;
-    r.scroll_mode = defaults.scroll_mode;
-    r.line_count = defaults.line_count;
-    r.line_height = defaults.line_height;
-    r.disable_acceleration = defaults.disable_acceleration;
-    r.button_map = defaults.button_map;
 
     for specificity in 0..=2u8 {
         for p in &cfg.mouse.profiles {
@@ -268,7 +264,7 @@ fn resolve_from(
                     let Ok(button) = btn.parse::<u32>() else {
                         continue;
                     };
-                    if button != 3 && button != 4 {
+                    if !supports_button(button) {
                         continue;
                     }
                     if let Some(key) = buttons::parse_action(action) {

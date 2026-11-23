@@ -372,10 +372,17 @@ unsafe extern "C" fn mouse_event_tap_callback(
         } else if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN
             || event_type == K_CG_EVENT_OTHER_MOUSE_UP
         {
-            let flags: CGEventFlags = CGEventGetFlags(event);
             let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
             let debug_enabled = crate::logger::enabled(crate::logger::LogLevel::Debug);
-            log_button_event_diag(event_type, event, button, flags);
+            if debug_enabled {
+                log_button_event_diag(event_type, event, button, CGEventGetFlags(event));
+            }
+            let Ok(button_u32) = u32::try_from(button) else {
+                return event;
+            };
+            if !resolve::supports_button(button_u32) {
+                return event;
+            }
 
             let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
                 device::device_from_cgevent(event)
@@ -383,20 +390,21 @@ unsafe extern "C" fn mouse_event_tap_callback(
                 None
             };
             let app_key = app::active_identity();
-            let resolved = resolve::resolve(dev_key, app_key.clone());
-            if let Some(action) = resolved.button_map.get(&(button as u32)) {
+            let debug_app = if debug_enabled { app_key.clone() } else { None };
+            let resolved = resolve::resolve(dev_key, app_key);
+            if let Some(action) = resolved.button_map.get(&button_u32) {
                 log_debug!(
                     "[mouse] button {}({}) mapped to {:?} (dev={:?}, app={:?})",
                     button,
                     button_name(button),
                     action,
                     dev_key,
-                    app_key
+                    debug_app
                 );
                 if event_type == K_CG_EVENT_OTHER_MOUSE_DOWN {
-                    buttons::handle_down(button as u32, action);
+                    buttons::handle_down(button_u32, action);
                 } else {
-                    buttons::handle_up(button as u32);
+                    buttons::handle_up(button_u32);
                 }
                 return std::ptr::null_mut();
             }
