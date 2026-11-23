@@ -73,6 +73,7 @@ static CACHE: std::sync::LazyLock<
 const FLAG_COMPUTED: u8 = 1 << 0;
 const FLAG_APP_SCROLL: u8 = 1 << 1;
 const FLAG_HAS_DEVICE: u8 = 1 << 2;
+const FLAG_DEVICE_SCROLL: u8 = 1 << 3;
 
 static APP_PROFILE_FLAGS: AtomicU8 = AtomicU8::new(0);
 static CONFIG_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -83,7 +84,7 @@ pub(crate) fn config_generation() -> u64 {
 
 pub(crate) fn resolve_scroll_for_app(app: Option<&AppIdentity>) -> ResolvedScroll {
     let cfg = CONFIG.read().unwrap();
-    resolve_from(&cfg, None, app).scroll()
+    resolve_scroll_from(&cfg, None, app)
 }
 
 pub(crate) fn invalidate_cache() {
@@ -95,6 +96,21 @@ pub(crate) fn invalidate_cache() {
     crate::app::refresh_scroll_cache();
 }
 
+fn has_device_filter(profile: &MouseProfile) -> bool {
+    profile.device.vendor_id.is_some() || profile.device.product_id.is_some()
+}
+
+fn has_app_filter(profile: &MouseProfile) -> bool {
+    profile.app_bundle_id.is_some() || profile.app_name.is_some()
+}
+
+fn affects_scroll(profile: &MouseProfile) -> bool {
+    profile.reverse_scroll.is_some()
+        || profile.scroll_mode.is_some()
+        || profile.line_count.is_some()
+        || profile.line_height.is_some()
+}
+
 fn app_profile_flags() -> u8 {
     let flags = APP_PROFILE_FLAGS.load(Ordering::Acquire);
     if flags & FLAG_COMPUTED != 0 {
@@ -103,17 +119,14 @@ fn app_profile_flags() -> u8 {
     let cfg = CONFIG.read().unwrap();
     let mut computed = FLAG_COMPUTED;
     for p in &cfg.mouse.profiles {
-        if p.device.vendor_id.is_some() || p.device.product_id.is_some() {
+        let scroll = affects_scroll(p);
+        if has_device_filter(p) {
             computed |= FLAG_HAS_DEVICE;
+            if scroll {
+                computed |= FLAG_DEVICE_SCROLL;
+            }
         }
-        if p.app_bundle_id.is_none() && p.app_name.is_none() {
-            continue;
-        }
-        if p.reverse_scroll.is_some()
-            || p.scroll_mode.is_some()
-            || p.line_count.is_some()
-            || p.line_height.is_some()
-        {
+        if scroll && has_app_filter(p) {
             computed |= FLAG_APP_SCROLL;
         }
     }
@@ -130,14 +143,10 @@ fn any_matches_per_app_scroll_profile_in<'a>(
     mut apps: impl Iterator<Item = &'a AppIdentity>,
 ) -> bool {
     apps.any(|app| {
-        cfg.mouse.profiles.iter().any(|p| {
-            (p.app_bundle_id.is_some() || p.app_name.is_some())
-                && (p.reverse_scroll.is_some()
-                    || p.scroll_mode.is_some()
-                    || p.line_count.is_some()
-                    || p.line_height.is_some())
-                && app_matches(p, Some(app))
-        })
+        cfg.mouse
+            .profiles
+            .iter()
+            .any(|p| has_app_filter(p) && affects_scroll(p) && app_matches(p, Some(app)))
     })
 }
 
@@ -149,6 +158,25 @@ pub(crate) fn any_matches_per_app_scroll_profile<'a>(
     }
     let cfg = CONFIG.read().unwrap();
     any_matches_per_app_scroll_profile_in(&cfg, apps)
+}
+
+pub(crate) fn has_per_device_scroll_profiles() -> bool {
+    app_profile_flags() & FLAG_DEVICE_SCROLL != 0
+}
+
+fn device_matches_scroll_profile_in(cfg: &Config, device: DeviceKey) -> bool {
+    cfg.mouse
+        .profiles
+        .iter()
+        .any(|p| has_device_filter(p) && affects_scroll(p) && device_matches(p, Some(device)))
+}
+
+pub(crate) fn device_matches_scroll_profile(device: DeviceKey) -> bool {
+    if !has_per_device_scroll_profiles() {
+        return false;
+    }
+    let cfg = CONFIG.read().unwrap();
+    device_matches_scroll_profile_in(&cfg, device)
 }
 
 pub(crate) fn has_per_device_profiles() -> bool {
@@ -229,30 +257,52 @@ pub(crate) fn supports_button(button: u32) -> bool {
     matches!(button, 3 | 4)
 }
 
+fn apply_scroll_fields(scroll: &mut ResolvedScroll, p: &MouseProfile) {
+    if let Some(rs) = p.reverse_scroll {
+        scroll.reverse_scroll = rs;
+    }
+    if let Some(ref mode) = p.scroll_mode {
+        scroll.scroll_mode = ScrollMode::from_str(mode);
+    }
+    if let Some(lc) = p.line_count {
+        scroll.line_count = lc.clamp(1, crate::config::MAX_LINE_COUNT);
+    }
+    if let Some(lh) = p.line_height {
+        scroll.line_height = Some(lh.clamp(1, crate::config::MAX_LINE_HEIGHT));
+    }
+}
+
+fn resolve_scroll_from(
+    cfg: &Config,
+    device: Option<DeviceKey>,
+    app: Option<&AppIdentity>,
+) -> ResolvedScroll {
+    let mut scroll = ResolvedScroll::default();
+    for specificity in 0..=2u8 {
+        for p in &cfg.mouse.profiles {
+            if profile_specificity(p) != specificity || !matches(p, device, app) {
+                continue;
+            }
+            apply_scroll_fields(&mut scroll, p);
+        }
+    }
+    scroll
+}
+
 fn resolve_from(
     cfg: &Config,
     device: Option<DeviceKey>,
     app: Option<&AppIdentity>,
 ) -> ResolvedMouse {
     let mut r = ResolvedMouse::default();
+    let mut scroll = r.scroll();
 
     for specificity in 0..=2u8 {
         for p in &cfg.mouse.profiles {
             if profile_specificity(p) != specificity || !matches(p, device, app) {
                 continue;
             }
-            if let Some(rs) = p.reverse_scroll {
-                r.reverse_scroll = rs;
-            }
-            if let Some(ref mode) = p.scroll_mode {
-                r.scroll_mode = ScrollMode::from_str(mode);
-            }
-            if let Some(lc) = p.line_count {
-                r.line_count = lc.clamp(1, crate::config::MAX_LINE_COUNT);
-            }
-            if let Some(lh) = p.line_height {
-                r.line_height = Some(lh.clamp(1, crate::config::MAX_LINE_HEIGHT));
-            }
+            apply_scroll_fields(&mut scroll, p);
             if let Some(ref ptr) = p.pointer
                 && let Some(da) = ptr.disable_acceleration
             {
@@ -275,6 +325,10 @@ fn resolve_from(
         }
     }
 
+    r.reverse_scroll = scroll.reverse_scroll;
+    r.scroll_mode = scroll.scroll_mode;
+    r.line_count = scroll.line_count;
+    r.line_height = scroll.line_height;
     r
 }
 
@@ -814,5 +868,47 @@ mod tests {
             &cfg,
             [&safari, &continuity].into_iter()
         ));
+    }
+
+    #[test]
+    fn device_matches_scroll_profile_ignores_button_only_and_unmatched_devices() {
+        let mut cfg = Config::default();
+        cfg.mouse.profiles.clear();
+        cfg.mouse.profiles.push(MouseProfile {
+            reverse_scroll: Some(true),
+            scroll_mode: Some("pixel".into()),
+            line_count: Some(4),
+            ..Default::default()
+        });
+        cfg.mouse.profiles.push(MouseProfile {
+            device: crate::config::DeviceMatcher {
+                vendor_id: Some(0x046d),
+                product_id: Some(0xc548),
+            },
+            button_map: Some(BTreeMap::from([("3".to_string(), "cmd+[".to_string())])),
+            ..Default::default()
+        });
+        cfg.mouse.profiles.push(MouseProfile {
+            device: crate::config::DeviceMatcher {
+                vendor_id: Some(0x05ac),
+                product_id: None,
+            },
+            reverse_scroll: Some(false),
+            ..Default::default()
+        });
+
+        assert!(!device_matches_scroll_profile_in(&cfg, (0x046d, 0xc548)));
+        assert!(!device_matches_scroll_profile_in(&cfg, (0x1532, 0x0084)));
+        assert!(device_matches_scroll_profile_in(&cfg, (0x05ac, 0x0304)));
+
+        let safari = safari_identity();
+        assert_eq!(
+            resolve_scroll_from(&cfg, None, Some(&safari)),
+            resolve_from(&cfg, Some((0x046d, 0xc548)), Some(&safari)).scroll()
+        );
+        assert_eq!(
+            resolve_scroll_from(&cfg, None, Some(&safari)),
+            resolve_from(&cfg, Some((0x1532, 0x0084)), Some(&safari)).scroll()
+        );
     }
 }

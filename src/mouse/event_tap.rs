@@ -30,6 +30,8 @@ const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
 const MAX_SCROLL_EVENT_AGE_NS: u64 = 25_000_000;
 const MAX_SANE_EVENT_AGE_NS: u64 = 10_000_000_000;
 const MIN_SCROLL_INTERVAL_NS: u64 = 8_000_000;
+const SOURCE_CADENCE_TOLERANCE_NS: u64 = 250_000;
+const DISPATCH_JITTER_TOLERANCE_NS: u64 = 2_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScrollDropDecision {
@@ -41,11 +43,15 @@ enum ScrollDropDecision {
 #[derive(Debug, Clone, Copy, Default)]
 struct ScrollDropGate {
     last_emitted_ns: u64,
+    last_event_ns: u64,
 }
 
 impl ScrollDropGate {
     const fn new() -> Self {
-        Self { last_emitted_ns: 0 }
+        Self {
+            last_emitted_ns: 0,
+            last_event_ns: 0,
+        }
     }
 
     fn evaluate(&mut self, now_ns: u64, ev_ts_ns: u64) -> ScrollDropDecision {
@@ -57,11 +63,27 @@ impl ScrollDropGate {
         }
         if self.last_emitted_ns > 0 && now_ns >= self.last_emitted_ns {
             let dt_ns = now_ns - self.last_emitted_ns;
-            if dt_ns < MIN_SCROLL_INTERVAL_NS {
+            let on_schedule = self.last_event_ns != 0
+                && ev_ts_ns > 0
+                && ev_ts_ns <= now_ns
+                && ev_ts_ns.saturating_sub(self.last_event_ns)
+                    >= MIN_SCROLL_INTERVAL_NS - SOURCE_CADENCE_TOLERANCE_NS;
+            let min_dt_ns = if on_schedule {
+                MIN_SCROLL_INTERVAL_NS - DISPATCH_JITTER_TOLERANCE_NS
+            } else {
+                MIN_SCROLL_INTERVAL_NS
+            };
+            if dt_ns < min_dt_ns {
                 return ScrollDropDecision::DropRateLimit(dt_ns);
             }
         }
         self.last_emitted_ns = now_ns;
+        self.last_event_ns =
+            if ev_ts_ns > 0 && ev_ts_ns <= now_ns && now_ns - ev_ts_ns <= MAX_SCROLL_EVENT_AGE_NS {
+                ev_ts_ns
+            } else {
+                0
+            };
         ScrollDropDecision::Allow
     }
 }
@@ -102,7 +124,6 @@ unsafe fn mutate_scroll_line_in_place(event: CGEventRef, dy: i32, dx: i32) {
     let dy64 = dy as i64;
     let dx64 = dx as i64;
     unsafe {
-        CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS, 0);
         CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1, dy64);
         CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2, dx64);
         CGEventSetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1, dy64 * 10);
@@ -234,14 +255,14 @@ unsafe extern "C" fn mouse_event_tap_callback(
         }
 
         if event_type == K_CG_EVENT_SCROLL_WHEEL {
-            let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
-            if is_synthetic_scroll_marker(user_data) {
-                return event;
-            }
-
             let continuous =
                 CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS);
             if continuous != 0 {
+                return event;
+            }
+
+            let user_data = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
+            if is_synthetic_scroll_marker(user_data) {
                 return event;
             }
 
@@ -270,10 +291,19 @@ unsafe extern "C" fn mouse_event_tap_callback(
                 }
             }
 
-            let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
-            let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
+            let line_deltas = || {
+                (
+                    CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
+                    CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2),
+                )
+            };
 
-            if !debug_enabled && !resolve::has_per_device_profiles() {
+            let dev_key = if debug_enabled || resolve::has_per_device_scroll_profiles() {
+                device::device_from_cgevent(event)
+            } else {
+                None
+            };
+            if !debug_enabled && !dev_key.is_some_and(resolve::device_matches_scroll_profile) {
                 let scroll = if app::needs_cursor_window_lookup() {
                     let loc = CGEventGetLocation(event);
                     app::scroll_at_point_or_active(loc.x, loc.y)
@@ -290,6 +320,7 @@ unsafe extern "C" fn mouse_event_tap_callback(
                         K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2,
                     );
                     let (point_dy, point_dx) = if raw_point_dy == 0 && raw_point_dx == 0 {
+                        let (dy, dx) = line_deltas();
                         (dy * 10, dx * 10)
                     } else {
                         (raw_point_dy, raw_point_dx)
@@ -299,21 +330,17 @@ unsafe extern "C" fn mouse_event_tap_callback(
                         mutate_scroll_pixel_in_place(event, ndy, ndx);
                     }
                 } else {
+                    let (dy, dx) = line_deltas();
                     let (ndy, ndx, unit) = compute_delta(dy, dx, scroll);
                     apply_scroll_in_place(event, ndy, ndx, unit);
                 }
                 return event;
             }
 
-            let flags: CGEventFlags = CGEventGetFlags(event);
             let loc = CGEventGetLocation(event);
             let app_key = scroll_app_at_cursor(loc.x, loc.y).or_else(app::active_identity);
-            let dev_key = if resolve::has_per_device_profiles() || debug_enabled {
-                device::device_from_cgevent(event)
-            } else {
-                None
-            };
-            let resolved = resolve::resolve(dev_key, app_key.clone());
+            let debug_app = if debug_enabled { app_key.clone() } else { None };
+            let resolved = resolve::resolve(dev_key, app_key);
             let scroll = resolved.scroll();
 
             if scroll.scroll_mode == ScrollMode::Continuous {
@@ -321,17 +348,25 @@ unsafe extern "C" fn mouse_event_tap_callback(
                     CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
                 let raw_point_dx =
                     CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
+                let cached_line = if (raw_point_dy == 0 && raw_point_dx == 0) || debug_enabled {
+                    Some(line_deltas())
+                } else {
+                    None
+                };
                 let (point_dy, point_dx) = if raw_point_dy == 0 && raw_point_dx == 0 {
+                    let (dy, dx) = cached_line.unwrap_or((0, 0));
                     (dy * 10, dx * 10)
                 } else {
                     (raw_point_dy, raw_point_dx)
                 };
                 let (ndy, ndx) = compute_continuous_delta(point_dy, point_dx, scroll);
                 if debug_enabled {
+                    let (dy, dx) = cached_line.unwrap_or((0, 0));
+                    let flags = CGEventGetFlags(event);
                     log_debug!(
                         "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode=continuous out=({},{},cont) flags=0x{:x} reverse={}",
                         dev_key,
-                        app_key,
+                        debug_app,
                         loc.x,
                         loc.y,
                         dy,
@@ -346,12 +381,14 @@ unsafe extern "C" fn mouse_event_tap_callback(
                     mutate_scroll_pixel_in_place(event, ndy, ndx);
                 }
             } else {
+                let (dy, dx) = line_deltas();
                 let (ndy, ndx, unit) = compute_delta(dy, dx, scroll);
                 if debug_enabled {
+                    let flags = CGEventGetFlags(event);
                     log_debug!(
                         "[mouse] scroll dev={:?} app={:?} cursor=({:.0},{:.0}) dy={} dx={} mode={} lc={} lh={:?} out=({},{},{:?}) flags=0x{:x} reverse={}",
                         dev_key,
-                        app_key,
+                        debug_app,
                         loc.x,
                         loc.y,
                         dy,
@@ -566,5 +603,31 @@ mod tests {
             ScrollDropDecision::DropRateLimit(4 * MS)
         );
         assert_eq!(gate.evaluate(116 * MS, 116 * MS), ScrollDropDecision::Allow);
+    }
+
+    #[test]
+    fn scroll_drop_gate_tolerates_125hz_dispatch_and_clock_jitter() {
+        let mut gate = ScrollDropGate::new();
+        assert_eq!(
+            gate.evaluate(101_200_000, 100_000_000),
+            ScrollDropDecision::Allow
+        );
+        assert_eq!(
+            gate.evaluate(108_000_000, 107_850_000),
+            ScrollDropDecision::Allow
+        );
+    }
+
+    #[test]
+    fn scroll_drop_gate_still_drops_queued_back_to_back_bursts() {
+        let mut gate = ScrollDropGate::new();
+        assert_eq!(
+            gate.evaluate(105 * MS, 90 * MS),
+            ScrollDropDecision::Allow
+        );
+        assert_eq!(
+            gate.evaluate(106 * MS, 98 * MS),
+            ScrollDropDecision::DropRateLimit(MS)
+        );
     }
 }

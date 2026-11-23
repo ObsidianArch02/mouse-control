@@ -65,8 +65,8 @@ pub(crate) fn compute_delta(
     let (mut ndy, mut ndx, unit) = match mode {
         ScrollMode::Default => (dy as i32, dx as i32, ScrollUnit::Line),
         ScrollMode::Discrete => {
-            let sign_y = if dy != 0 { dy.signum() } else { 0 };
-            let sign_x = if dx != 0 { dx.signum() } else { 0 };
+            let sign_y = dy.signum();
+            let sign_x = dx.signum();
             let line_count = r.line_count.clamp(1, crate::config::MAX_LINE_COUNT) as i64;
             (
                 (sign_y * line_count) as i32,
@@ -75,8 +75,8 @@ pub(crate) fn compute_delta(
             )
         }
         ScrollMode::Pixel => {
-            let sign_y = if dy != 0 { dy.signum() } else { 0 };
-            let sign_x = if dx != 0 { dx.signum() } else { 0 };
+            let sign_y = dy.signum();
+            let sign_x = dx.signum();
             let h = r
                 .line_height
                 .unwrap_or(DEFAULT_LINE_HEIGHT)
@@ -89,8 +89,8 @@ pub(crate) fn compute_delta(
             )
         }
         ScrollMode::Line => {
-            let sign_y = if dy != 0 { dy.signum() } else { 0 };
-            let sign_x = if dx != 0 { dx.signum() } else { 0 };
+            let sign_y = dy.signum();
+            let sign_x = dx.signum();
             match r.line_height {
 
                 Some(h) => {
