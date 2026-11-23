@@ -424,12 +424,14 @@ fn ensure_snap_worker() {
                     let target_epoch = APP_EPOCH.load(Ordering::Acquire);
                     let target_cfg_gen = crate::mouse::resolve::config_generation();
                     let windows = autoreleasepool(|_| unsafe { capture_window_rects() });
+                    let previous;
                     {
                         let mut snap = WINDOW_SNAPSHOT.lock().unwrap();
-                        snap.windows = windows;
+                        previous = std::mem::replace(&mut snap.windows, windows);
                         snap.epoch = target_epoch;
                         snap.config_gen = target_cfg_gen;
                     }
+                    drop(previous);
                     if APP_EPOCH.load(Ordering::Acquire) == target_epoch
                         && crate::mouse::resolve::config_generation() == target_cfg_gen
                     {

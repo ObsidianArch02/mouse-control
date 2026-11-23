@@ -28,7 +28,9 @@ pub struct LogConfig {
     pub log_stdout: bool,
 }
 
-static LOG_TX: OnceLock<Sender<(LogLevel, String)>> = OnceLock::new();
+type LogEntry = (SystemTime, LogLevel, String);
+
+static LOG_TX: OnceLock<Sender<LogEntry>> = OnceLock::new();
 static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Info as usize);
 
 const LOG_CHANNEL_CAPACITY: usize = 512;
@@ -65,15 +67,12 @@ pub fn _log(level: LogLevel, args: fmt::Arguments<'_>) {
         return;
     }
     if let Some(tx) = LOG_TX.get() {
-        let ts = now_timestamp();
-        let msg = format!("{} {} {}\n", ts, level.as_str(), args);
-
-        let _ = tx.try_send((level, msg));
+        let _ = tx.try_send((SystemTime::now(), level, args.to_string()));
     }
 }
 
 pub fn init(config: &LogConfig, is_dev: bool) {
-    let (tx, rx) = flume::bounded::<(LogLevel, String)>(LOG_CHANNEL_CAPACITY);
+    let (tx, rx) = flume::bounded::<LogEntry>(LOG_CHANNEL_CAPACITY);
     LOG_TX.set(tx).ok();
     LOG_LEVEL.store(config.level as usize, Ordering::Relaxed);
 
@@ -88,11 +87,12 @@ pub fn reconfigure(level: LogLevel) {
 fn write_log_entry(
     stdout: &mut Option<BufWriter<std::io::Stdout>>,
     file: &mut Option<BufWriter<std::fs::File>>,
-    level: LogLevel,
-    msg: &str,
+    entry: LogEntry,
     flush_now: &mut bool,
     count: &mut usize,
 ) {
+    let (time, level, message) = entry;
+    let msg = format!("{} {} {}\n", timestamp(time), level.as_str(), message);
     if let Some(out) = stdout {
         let _ = out.write_all(msg.as_bytes());
     }
@@ -105,7 +105,7 @@ fn write_log_entry(
     }
 }
 
-fn writer_loop(rx: Receiver<(LogLevel, String)>, write_stdout: bool, file_path: Option<String>) {
+fn writer_loop(rx: Receiver<LogEntry>, write_stdout: bool, file_path: Option<String>) {
     let mut stdout: Option<BufWriter<std::io::Stdout>> =
         write_stdout.then(|| BufWriter::new(std::io::stdout()));
     let mut file: Option<BufWriter<std::fs::File>> = file_path
@@ -121,25 +121,23 @@ fn writer_loop(rx: Receiver<(LogLevel, String)>, write_stdout: bool, file_path: 
         })
         .map(BufWriter::new);
 
-    while let Ok((first_level, first_msg)) = rx.recv() {
+    while let Ok(first) = rx.recv() {
         let mut flush_now = false;
         let mut count = 0usize;
         write_log_entry(
             &mut stdout,
             &mut file,
-            first_level,
-            &first_msg,
+            first,
             &mut flush_now,
             &mut count,
         );
 
         while count < DEBUG_BATCH_MAX {
             match rx.try_recv() {
-                Ok((lvl, m)) => write_log_entry(
+                Ok(entry) => write_log_entry(
                     &mut stdout,
                     &mut file,
-                    lvl,
-                    &m,
+                    entry,
                     &mut flush_now,
                     &mut count,
                 ),
@@ -149,11 +147,10 @@ fn writer_loop(rx: Receiver<(LogLevel, String)>, write_stdout: bool, file_path: 
 
         while !flush_now && count < DEBUG_BATCH_MAX {
             match rx.recv_timeout(DEBUG_FLUSH_DELAY) {
-                Ok((lvl, m)) => write_log_entry(
+                Ok(entry) => write_log_entry(
                     &mut stdout,
                     &mut file,
-                    lvl,
-                    &m,
+                    entry,
                     &mut flush_now,
                     &mut count,
                 ),
@@ -254,8 +251,8 @@ unsafe extern "C" {
     fn localtime_r(time: *const TimeT, result: *mut Tm) -> *mut Tm;
 }
 
-fn now_timestamp() -> String {
-    let now = SystemTime::now()
+fn timestamp(time: SystemTime) -> String {
+    let now = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
