@@ -1,10 +1,10 @@
 class MouseControl < Formula
   desc "macOS menu bar utility for scroll direction, unified scroll travel, and side button remapping"
   homepage "https://github.com/ObsidianArch02/mouse-control"
-  url "https://github.com/ObsidianArch02/mouse-control/releases/download/v0.1.1/mouse-control-v0.1.1-darwin-arm64.tar.gz"
+  url "https://github.com/ObsidianArch02/mouse-control/releases/download/v0.1.2/mouse-control-v0.1.2-darwin-arm64.tar.gz"
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
   license "MIT"
-  version "0.1.1"
+  version "0.1.2"
 
   depends_on :macos
   depends_on arch: :arm64
