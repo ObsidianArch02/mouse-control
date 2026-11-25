@@ -56,13 +56,73 @@ static REGISTRY: OnceLock<Mutex<DeviceRegistry>> = OnceLock::new();
 struct HidRunloopState {
     ready: bool,
     runloop: Option<crate::mouse::ffi::CFRunLoopRef>,
+    retire_source: Option<crate::mouse::ffi::CFRunLoopSourceRef>,
 }
 unsafe impl Send for HidRunloopState {}
 unsafe impl Sync for HidRunloopState {}
 
+struct RetiredHidClient {
+    client: *mut c_void,
+    runloop: crate::mouse::ffi::CFRunLoopRef,
+}
+unsafe impl Send for RetiredHidClient {}
+
 static HID_RUNLOOP: OnceLock<(Mutex<HidRunloopState>, Condvar)> = OnceLock::new();
 static HID_MONITOR_THREAD: OnceLock<()> = OnceLock::new();
 static PLUG_MONITOR_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RETIRE_QUEUE: Mutex<Vec<RetiredHidClient>> = Mutex::new(Vec::new());
+
+unsafe extern "C" fn drain_retired_hid_clients(_info: *mut c_void) {
+    let items: Vec<RetiredHidClient> = {
+        let mut queue = RETIRE_QUEUE.lock().unwrap();
+        std::mem::take(&mut *queue)
+    };
+    unsafe {
+        for item in items {
+            IOHIDEventSystemClientUnscheduleWithRunLoop(
+                item.client,
+                item.runloop,
+                crate::mouse::ffi::kCFRunLoopDefaultMode,
+            );
+            CFRelease(item.runloop as *const c_void);
+            CFRelease(item.client as *const c_void);
+        }
+    }
+}
+
+unsafe fn retire_hid_client(client: *mut c_void, rl: Option<crate::mouse::ffi::CFRunLoopRef>) {
+    if client.is_null() {
+        if let Some(rl) = rl {
+            unsafe { CFRelease(rl as *const c_void) };
+        }
+        return;
+    }
+    let Some(rl) = rl else {
+        unsafe { CFRelease(client as *const c_void) };
+        return;
+    };
+    let source = hid_runloop_sync().0.lock().unwrap().retire_source;
+    if let Some(src) = source {
+        RETIRE_QUEUE
+            .lock()
+            .unwrap()
+            .push(RetiredHidClient { client, runloop: rl });
+        unsafe {
+            CFRunLoopSourceSignal(src);
+            CFRunLoopWakeUp(rl);
+        }
+    } else {
+        unsafe {
+            IOHIDEventSystemClientUnscheduleWithRunLoop(
+                client,
+                rl,
+                crate::mouse::ffi::kCFRunLoopDefaultMode,
+            );
+            CFRelease(rl as *const c_void);
+            CFRelease(client as *const c_void);
+        }
+    }
+}
 
 fn hid_runloop_sync() -> &'static (Mutex<HidRunloopState>, Condvar) {
     HID_RUNLOOP.get_or_init(|| {
@@ -70,6 +130,7 @@ fn hid_runloop_sync() -> &'static (Mutex<HidRunloopState>, Condvar) {
             Mutex::new(HidRunloopState {
                 ready: false,
                 runloop: None,
+                retire_source: None,
             }),
             Condvar::new(),
         )
@@ -130,6 +191,27 @@ fn ensure_hid_runloop() -> Option<crate::mouse::ffi::CFRunLoopRef> {
                         rl,
                         crate::mouse::ffi::kCFRunLoopDefaultMode,
                     );
+                    let mut retire_ctx = CFRunLoopSourceContext {
+                        version: 0,
+                        info: std::ptr::null_mut(),
+                        retain: None,
+                        release: None,
+                        copy_description: None,
+                        equal: None,
+                        hash: None,
+                        schedule: None,
+                        cancel: None,
+                        perform: Some(drain_retired_hid_clients),
+                    };
+                    let retire_source =
+                        CFRunLoopSourceCreate(std::ptr::null_mut(), 0, &mut retire_ctx);
+                    if !retire_source.is_null() {
+                        CFRunLoopAddSource(
+                            rl,
+                            retire_source,
+                            crate::mouse::ffi::kCFRunLoopDefaultMode,
+                        );
+                    }
                     crate::ffi::CFRetain(rl as *const c_void);
                     *manager_static().lock().unwrap() = manager_obj;
                     log_info!("[device] plug/unplug monitor started.");
@@ -137,6 +219,7 @@ fn ensure_hid_runloop() -> Option<crate::mouse::ffi::CFRunLoopRef> {
                     let mut state = pair.0.lock().unwrap();
                     state.ready = true;
                     state.runloop = Some(rl);
+                    state.retire_source = (!retire_source.is_null()).then_some(retire_source);
                     pair.1.notify_all();
                     true
                 });
@@ -246,15 +329,7 @@ unsafe fn build_state() -> RegistryState {
         if services.is_null() {
 
             log_info!("[device] no services returned");
-            if let Some(rl) = state.scheduled_rl.take() {
-                IOHIDEventSystemClientUnscheduleWithRunLoop(
-                    client,
-                    rl,
-                    crate::mouse::ffi::kCFRunLoopDefaultMode,
-                );
-                CFRelease(rl as *const c_void);
-            }
-            CFRelease(client as *const c_void);
+            retire_hid_client(client, state.scheduled_rl.take());
             return state;
         }
         state.client = client;
@@ -319,19 +394,7 @@ unsafe fn swap_state(new: RegistryState) {
         if !old_services.is_null() {
             CFRelease(old_services as *const c_void);
         }
-        if !old_client.is_null() {
-            if let Some(rl) = old_rl {
-                IOHIDEventSystemClientUnscheduleWithRunLoop(
-                    old_client,
-                    rl,
-                    crate::mouse::ffi::kCFRunLoopDefaultMode,
-                );
-                CFRelease(rl as *const c_void);
-            }
-            CFRelease(old_client as *const c_void);
-        } else if let Some(rl) = old_rl {
-            CFRelease(rl as *const c_void);
-        }
+        retire_hid_client(old_client, old_rl);
     }
 }
 

@@ -72,6 +72,9 @@ unsafe extern "C" {
     pub(crate) fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
 
     #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn CGEventSourceCreate(state_id: i32) -> CGEventSourceRef;
+
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn CGEventCreateKeyboardEvent(
         source: CGEventSourceRef,
         virtual_key: CGKeyCode,
@@ -95,6 +98,21 @@ unsafe extern "C" {
     pub(crate) fn clock_gettime_nsec_np(clock_id: u32) -> u64;
 }
 
+#[repr(C)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) struct CFRunLoopSourceContext {
+    pub version: isize,
+    pub info: *mut c_void,
+    pub retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+    pub release: Option<unsafe extern "C" fn(*const c_void)>,
+    pub copy_description: Option<unsafe extern "C" fn(*const c_void) -> CFStringRef>,
+    pub equal: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> u8>,
+    pub hash: Option<unsafe extern "C" fn(*const c_void) -> usize>,
+    pub schedule: Option<unsafe extern "C" fn(*mut c_void, CFRunLoopRef, CFStringRef)>,
+    pub cancel: Option<unsafe extern "C" fn(*mut c_void, CFRunLoopRef, CFStringRef)>,
+    pub perform: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     pub(crate) fn CFMachPortCreateRunLoopSource(
@@ -103,6 +121,15 @@ unsafe extern "C" {
         order: i64,
     ) -> CFRunLoopSourceRef;
     pub(crate) fn CFMachPortInvalidate(port: CFMachPortRef);
+
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn CFRunLoopSourceCreate(
+        allocator: CFAllocatorRef,
+        order: isize,
+        context: *mut CFRunLoopSourceContext,
+    ) -> CFRunLoopSourceRef;
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn CFRunLoopSourceSignal(source: CFRunLoopSourceRef);
 
     pub(crate) fn CFRunLoopAddSource(
         rl: CFRunLoopRef,
@@ -117,6 +144,8 @@ unsafe extern "C" {
     pub(crate) fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     pub(crate) fn CFRunLoopRun();
     pub(crate) fn CFRunLoopStop(rl: CFRunLoopRef);
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn CFRunLoopWakeUp(rl: CFRunLoopRef);
 
     pub(crate) static kCFRunLoopDefaultMode: CFStringRef;
 }
@@ -398,6 +427,9 @@ pub(crate) const K_CG_SCROLL_WHEEL_EVENT_FIXED_PT_DELTA_AXIS_2: i32 = 94;
 
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const K_CG_HID_EVENT_TAP: i32 = 0;
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) const K_CG_EVENT_SOURCE_STATE_PRIVATE: i32 = -1;
 
 pub(crate) const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
 

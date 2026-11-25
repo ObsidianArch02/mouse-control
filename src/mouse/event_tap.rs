@@ -32,6 +32,49 @@ const MAX_SANE_EVENT_AGE_NS: u64 = 10_000_000_000;
 const MIN_SCROLL_INTERVAL_NS: u64 = 8_000_000;
 const SOURCE_CADENCE_TOLERANCE_NS: u64 = 250_000;
 const DISPATCH_JITTER_TOLERANCE_NS: u64 = 2_000_000;
+const TIMEOUT_BURST_LIMIT: usize = 5;
+const TIMEOUT_WINDOW_NS: u64 = 10_000_000_000;
+const REENABLE_COOLDOWN_NS: u64 = 2_000_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapTimeoutAction {
+    ReenableNow,
+    Cooldown(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TapTimeoutGuard {
+    recent_ns: [u64; TIMEOUT_BURST_LIMIT],
+    len: usize,
+}
+
+impl TapTimeoutGuard {
+    const fn new() -> Self {
+        Self {
+            recent_ns: [0; TIMEOUT_BURST_LIMIT],
+            len: 0,
+        }
+    }
+
+    fn record(&mut self, now_ns: u64) -> TapTimeoutAction {
+        let mut kept = 0usize;
+        for i in 0..self.len {
+            let ts = self.recent_ns[i];
+            if now_ns >= ts && now_ns - ts <= TIMEOUT_WINDOW_NS {
+                self.recent_ns[kept] = ts;
+                kept += 1;
+            }
+        }
+        self.len = kept;
+        if self.len + 1 >= TIMEOUT_BURST_LIMIT {
+            self.len = 0;
+            return TapTimeoutAction::Cooldown(REENABLE_COOLDOWN_NS);
+        }
+        self.recent_ns[self.len] = now_ns;
+        self.len += 1;
+        TapTimeoutAction::ReenableNow
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScrollDropDecision {
@@ -226,6 +269,12 @@ thread_local! {
     static SCROLL_GATE: Cell<ScrollDropGate> = const {
         Cell::new(ScrollDropGate::new())
     };
+    static TAP_TIMEOUT_GUARD: Cell<TapTimeoutGuard> = const {
+        Cell::new(TapTimeoutGuard::new())
+    };
+    static PENDING_REENABLE_AT_NS: Cell<u64> = const {
+        Cell::new(0)
+    };
 }
 
 unsafe extern "C" fn mouse_event_tap_callback(
@@ -238,14 +287,37 @@ unsafe extern "C" fn mouse_event_tap_callback(
         if event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
             || event_type == ffi::K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
         {
+            buttons::release_all();
+            SCROLL_GATE.with(|c| c.set(ScrollDropGate::new()));
             if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
                 let tap = CURRENT_TAP.with(|c| c.get());
                 if !tap.is_null() {
-                    ffi::CGEventTapEnable(tap, true);
-                    log_info!(
-                        "[mouse] event tap disabled by system (type=0x{:x}); re-enabled.",
-                        event_type
-                    );
+                    let now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                    let action = TAP_TIMEOUT_GUARD.with(|cell| {
+                        let mut guard = cell.get();
+                        let a = guard.record(now_ns);
+                        cell.set(guard);
+                        a
+                    });
+                    match action {
+                        TapTimeoutAction::ReenableNow => {
+                            ffi::CGEventTapEnable(tap, true);
+                            log_info!(
+                                "[mouse] event tap disabled by system (type=0x{:x}); re-enabled.",
+                                event_type
+                            );
+                        }
+                        TapTimeoutAction::Cooldown(cooldown_ns) => {
+                            PENDING_REENABLE_AT_NS
+                                .with(|c| c.set(now_ns.saturating_add(cooldown_ns)));
+                            log_info!(
+                                "[mouse] event tap disabled by system (type=0x{:x}); burst detected, cooling down {}ms.",
+                                event_type,
+                                cooldown_ns / 1_000_000
+                            );
+                            ffi::CFRunLoopStop(CFRunLoopGetCurrent());
+                        }
+                    }
                 }
             }
             return event;
@@ -521,6 +593,8 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             }
             CURRENT_TAP.with(|c| c.set(tap));
             SCROLL_GATE.with(|c| c.set(ScrollDropGate::new()));
+            TAP_TIMEOUT_GUARD.with(|c| c.set(TapTimeoutGuard::new()));
+            PENDING_REENABLE_AT_NS.with(|c| c.set(0));
             ffi::CGEventTapEnable(tap, true);
 
             crate::ffi::CFRetain(rl as *const c_void);
@@ -528,7 +602,30 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
                 log_info!("Mouse event tap started.");
 
-                ffi::CFRunLoopRun();
+                while !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                    let reenable_at = PENDING_REENABLE_AT_NS.with(|c| c.get());
+                    if reenable_at == 0 {
+                        ffi::CFRunLoopRun();
+                    } else {
+                        let now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+                        if now_ns < reenable_at {
+                            let wait_secs = (reenable_at - now_ns) as f64 / 1_000_000_000.0;
+                            crate::ffi::CFRunLoopRunInMode(
+                                crate::ffi::kCFRunLoopDefaultMode,
+                                wait_secs,
+                                0u8,
+                            );
+                        }
+                        if STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        if clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= reenable_at {
+                            PENDING_REENABLE_AT_NS.with(|c| c.set(0));
+                            ffi::CGEventTapEnable(tap, true);
+                            log_info!("[mouse] event tap re-enabled after cooldown.");
+                        }
+                    }
+                }
             }
             if let Some(r) = runloop_static().lock().unwrap().take() {
                 CFRelease(r as *const c_void);
@@ -628,6 +725,37 @@ mod tests {
         assert_eq!(
             gate.evaluate(106 * MS, 98 * MS),
             ScrollDropDecision::DropRateLimit(MS)
+        );
+    }
+
+    #[test]
+    fn tap_timeout_guard_triggers_cooldown_only_on_burst() {
+        let mut guard = TapTimeoutGuard::new();
+        for i in 0..4u64 {
+            assert_eq!(
+                guard.record(1_000 * MS + i * 1_000 * MS),
+                TapTimeoutAction::ReenableNow
+            );
+        }
+        assert_eq!(
+            guard.record(5_000 * MS),
+            TapTimeoutAction::Cooldown(REENABLE_COOLDOWN_NS)
+        );
+        assert_eq!(guard.record(8_000 * MS), TapTimeoutAction::ReenableNow);
+    }
+
+    #[test]
+    fn tap_timeout_guard_expires_old_timeouts_outside_window() {
+        let mut guard = TapTimeoutGuard::new();
+        for i in 0..4u64 {
+            assert_eq!(
+                guard.record(1_000 * MS + i * 1_000 * MS),
+                TapTimeoutAction::ReenableNow
+            );
+        }
+        assert_eq!(
+            guard.record(1_000 * MS + TIMEOUT_WINDOW_NS + 1_000 * MS),
+            TapTimeoutAction::ReenableNow
         );
     }
 }

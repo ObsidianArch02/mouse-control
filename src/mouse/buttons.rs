@@ -2,7 +2,7 @@ use crate::log_debug;
 #[cfg(not(test))]
 use crate::mouse::ffi::{
     self, CGEventCreateKeyboardEvent, CGEventGetFlags, CGEventPost, CGEventSetFlags,
-    K_CG_HID_EVENT_TAP,
+    CGEventSourceCreate, CGEventSourceRef, K_CG_EVENT_SOURCE_STATE_PRIVATE, K_CG_HID_EVENT_TAP,
 };
 use crate::mouse::ffi::{
     CGEventFlags, K_CG_EVENT_FLAG_MASK_ALTERNATE, K_CG_EVENT_FLAG_MASK_COMMAND,
@@ -400,6 +400,7 @@ fn key_sender() -> &'static flume::Sender<KeyJob> {
         std::thread::Builder::new()
             .name("button-keys".into())
             .spawn(move || {
+                let source = unsafe { CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_PRIVATE) };
                 while let Ok(job) = rx.recv() {
                     objc2::rc::autoreleasepool(|_| unsafe {
                         match job {
@@ -407,15 +408,29 @@ fn key_sender() -> &'static flume::Sender<KeyJob> {
                                 key,
                                 down,
                                 held_elsewhere,
-                            } => post_key_event(&key, down, held_elsewhere),
+                            } => post_key_event(source, &key, down, held_elsewhere),
                             KeyJob::ReleaseAll { keys, mods_used } => {
-                                for key in &keys {
-                                    post_key_event(key, false, mods_used);
-                                }
                                 let mut remaining = mods_used;
+                                for key in &keys {
+                                    if let KeyAction::Keyboard { keycode } = key.action
+                                        && MODIFIER_KEYCODES.iter().any(|(_, vk)| *vk == keycode)
+                                    {
+                                        continue;
+                                    }
+                                    post_key_event(source, key, false, remaining);
+                                }
+                                for key in &keys {
+                                    if let KeyAction::Keyboard { keycode } = key.action
+                                        && let Some((flag, _)) =
+                                            MODIFIER_KEYCODES.iter().find(|(_, vk)| *vk == keycode)
+                                    {
+                                        post_key_event(source, key, false, remaining);
+                                        remaining &= !*flag;
+                                    }
+                                }
                                 for (flag, vk) in MODIFIER_KEYCODES {
-                                    if mods_used & flag != 0 {
-                                        post_modifier_key(vk, flag, false, remaining);
+                                    if remaining & flag != 0 {
+                                        post_modifier_key(source, vk, flag, false, remaining);
                                         remaining &= !flag;
                                     }
                                 }
@@ -475,7 +490,12 @@ const MODIFIER_KEYCODES: [(CGEventFlags, u16); 4] = [
 ];
 
 #[cfg(not(test))]
-unsafe fn post_key_event(key: &PressedKey, down: bool, held_elsewhere: CGEventFlags) {
+unsafe fn post_key_event(
+    source: CGEventSourceRef,
+    key: &PressedKey,
+    down: bool,
+    held_elsewhere: CGEventFlags,
+) {
     unsafe {
         match key.action {
             KeyAction::Keyboard { keycode } => {
@@ -486,7 +506,7 @@ unsafe fn post_key_event(key: &PressedKey, down: bool, held_elsewhere: CGEventFl
                     if !is_modifier_main {
                         for (flag, vk) in MODIFIER_KEYCODES {
                             if key.modifiers & flag != 0 && held & flag == 0 {
-                                post_modifier_key(vk, flag, true, held);
+                                post_modifier_key(source, vk, flag, true, held);
                                 held |= flag;
                                 pressed_any_modifier = true;
                             }
@@ -496,14 +516,24 @@ unsafe fn post_key_event(key: &PressedKey, down: bool, held_elsewhere: CGEventFl
                     if pressed_any_modifier {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
-                    post_simple_key(keycode, true, effective_flags(key));
+                    post_simple_key(
+                        source,
+                        keycode,
+                        true,
+                        effective_flags(key, true, held_elsewhere),
+                    );
                 } else {
-                    post_simple_key(keycode, false, effective_flags(key));
+                    post_simple_key(
+                        source,
+                        keycode,
+                        false,
+                        effective_flags(key, false, held_elsewhere),
+                    );
                     if !is_modifier_main {
                         let mut held = held_elsewhere | key.modifiers;
                         for (flag, vk) in MODIFIER_KEYCODES {
                             if key.modifiers & flag != 0 && held_elsewhere & flag == 0 {
-                                post_modifier_key(vk, flag, false, held);
+                                post_modifier_key(source, vk, flag, false, held);
                                 held &= !flag;
                             }
                         }
@@ -518,35 +548,73 @@ unsafe fn post_key_event(key: &PressedKey, down: bool, held_elsewhere: CGEventFl
 }
 
 #[cfg(not(test))]
-unsafe fn post_simple_key(keycode: u16, down: bool, flags: CGEventFlags) {
+unsafe fn post_simple_key(
+    source: CGEventSourceRef,
+    keycode: u16,
+    down: bool,
+    flags: CGEventFlags,
+) {
     unsafe {
-        let ev = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, if down { 1 } else { 0 });
+        let ev = CGEventCreateKeyboardEvent(source, keycode, if down { 1 } else { 0 });
         if ev.is_null() {
             log_debug!("[buttons] failed to synthesize keyboard event");
             return;
         }
 
-        let inherited = CGEventGetFlags(ev) & !MODIFIER_FLAG_MASK;
-        CGEventSetFlags(ev, inherited | flags);
+        let merged = merge_event_flags(CGEventGetFlags(ev), flags);
+        CGEventSetFlags(ev, merged);
         CGEventPost(K_CG_HID_EVENT_TAP, ev);
         crate::ffi::CFRelease(ev as *const std::ffi::c_void);
     }
 }
 
-#[cfg_attr(test, allow(dead_code))]
 const MODIFIER_FLAG_MASK: CGEventFlags = K_CG_EVENT_FLAG_MASK_COMMAND
     | K_CG_EVENT_FLAG_MASK_CONTROL
     | K_CG_EVENT_FLAG_MASK_ALTERNATE
     | K_CG_EVENT_FLAG_MASK_SHIFT;
 
-#[cfg(not(test))]
-unsafe fn post_modifier_key(vk: u16, flag: CGEventFlags, down: bool, held: CGEventFlags) {
-    let flags = if down { held | flag } else { held & !flag };
-    unsafe { post_simple_key(vk, down, flags) };
+const DEVICE_MODIFIER_FLAG_MASK: CGEventFlags = 0x0000_207F;
+const NX_DEVICE_LCTL_KEY_MASK: CGEventFlags = 0x0000_0001;
+const NX_DEVICE_LSHIFT_KEY_MASK: CGEventFlags = 0x0000_0002;
+const NX_DEVICE_LCMD_KEY_MASK: CGEventFlags = 0x0000_0008;
+const NX_DEVICE_LALT_KEY_MASK: CGEventFlags = 0x0000_0020;
+
+fn device_modifier_flags(flags: CGEventFlags) -> CGEventFlags {
+    let mut out: CGEventFlags = 0;
+    if flags & K_CG_EVENT_FLAG_MASK_CONTROL != 0 {
+        out |= NX_DEVICE_LCTL_KEY_MASK;
+    }
+    if flags & K_CG_EVENT_FLAG_MASK_SHIFT != 0 {
+        out |= NX_DEVICE_LSHIFT_KEY_MASK;
+    }
+    if flags & K_CG_EVENT_FLAG_MASK_COMMAND != 0 {
+        out |= NX_DEVICE_LCMD_KEY_MASK;
+    }
+    if flags & K_CG_EVENT_FLAG_MASK_ALTERNATE != 0 {
+        out |= NX_DEVICE_LALT_KEY_MASK;
+    }
+    out
 }
 
-fn effective_flags(key: &PressedKey) -> CGEventFlags {
-    let mut flags = key.modifiers;
+fn merge_event_flags(inherited: CGEventFlags, flags: CGEventFlags) -> CGEventFlags {
+    let base = inherited & !(MODIFIER_FLAG_MASK | DEVICE_MODIFIER_FLAG_MASK);
+    base | flags | device_modifier_flags(flags)
+}
+
+#[cfg(not(test))]
+unsafe fn post_modifier_key(
+    source: CGEventSourceRef,
+    vk: u16,
+    flag: CGEventFlags,
+    down: bool,
+    held: CGEventFlags,
+) {
+    let flags = if down { held | flag } else { held & !flag };
+    unsafe { post_simple_key(source, vk, down, flags) };
+}
+
+fn effective_flags(key: &PressedKey, down: bool, held_elsewhere: CGEventFlags) -> CGEventFlags {
+    let mut flags = held_elsewhere | key.modifiers;
     if let KeyAction::Keyboard { keycode } = key.action {
         let own = match keycode {
             K_VK_COMMAND => K_CG_EVENT_FLAG_MASK_COMMAND,
@@ -555,7 +623,13 @@ fn effective_flags(key: &PressedKey) -> CGEventFlags {
             K_VK_SHIFT => K_CG_EVENT_FLAG_MASK_SHIFT,
             _ => 0,
         };
-        flags |= own;
+        if own != 0 {
+            if down {
+                flags |= own;
+            } else {
+                flags &= !own;
+            }
+        }
     }
     flags
 }
@@ -793,16 +867,40 @@ mod tests {
     }
 
     #[test]
-    fn effective_flags_adds_own_modifier_flag() {
+    fn effective_flags_handles_down_up_and_held_elsewhere() {
         let k = parse_action("cmd").unwrap();
-        assert_eq!(effective_flags(&k), K_CG_EVENT_FLAG_MASK_COMMAND);
+        assert_eq!(effective_flags(&k, true, 0), K_CG_EVENT_FLAG_MASK_COMMAND);
+        assert_eq!(effective_flags(&k, false, 0), 0);
+        assert_eq!(
+            effective_flags(&k, false, K_CG_EVENT_FLAG_MASK_SHIFT),
+            K_CG_EVENT_FLAG_MASK_SHIFT
+        );
+
         let k = parse_action("cmd+shift").unwrap();
         assert_eq!(
-            effective_flags(&k),
+            effective_flags(&k, true, 0),
             K_CG_EVENT_FLAG_MASK_COMMAND | K_CG_EVENT_FLAG_MASK_SHIFT
         );
-        let k = parse_action("cmd+left").unwrap();
-        assert_eq!(effective_flags(&k), K_CG_EVENT_FLAG_MASK_COMMAND);
+        assert_eq!(effective_flags(&k, false, 0), K_CG_EVENT_FLAG_MASK_COMMAND);
+
+        let k = parse_action("ctrl+right").unwrap();
+        assert_eq!(effective_flags(&k, true, 0), K_CG_EVENT_FLAG_MASK_CONTROL);
+        assert_eq!(
+            effective_flags(&k, false, K_CG_EVENT_FLAG_MASK_SHIFT),
+            K_CG_EVENT_FLAG_MASK_CONTROL | K_CG_EVENT_FLAG_MASK_SHIFT
+        );
+    }
+
+    #[test]
+    fn merge_event_flags_replaces_device_modifier_bits_and_keeps_arrow_bits() {
+        let inherited_arrow = 0x20a0_0000 | K_CG_EVENT_FLAG_MASK_COMMAND | NX_DEVICE_LCMD_KEY_MASK;
+        assert_eq!(
+            merge_event_flags(inherited_arrow, K_CG_EVENT_FLAG_MASK_CONTROL),
+            0x20a0_0000 | K_CG_EVENT_FLAG_MASK_CONTROL | NX_DEVICE_LCTL_KEY_MASK
+        );
+
+        let inherited_ctrl = 0x2004_0001;
+        assert_eq!(merge_event_flags(inherited_ctrl, 0), 0x2000_0000);
     }
 
     #[test]

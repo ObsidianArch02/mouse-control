@@ -401,8 +401,13 @@ pub fn set_enabled_and_persist(enabled: bool) -> Vec<String> {
             }
         },
         Err(_) => {
-            if let Ok(mut cfg) = CONFIG.write() {
+            let to_save = if let Ok(mut cfg) = CONFIG.write() {
                 cfg.mouse.enabled = enabled;
+                Some(cfg.clone())
+            } else {
+                None
+            };
+            if let Some(cfg) = to_save {
                 let _ = cfg.save();
             }
             Vec::new()
